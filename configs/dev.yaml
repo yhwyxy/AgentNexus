@@ -1,0 +1,3 @@
+server:
+  httpAddress: ":9001"
+  shutdownTimeout: 0s
