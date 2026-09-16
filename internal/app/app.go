@@ -16,6 +16,8 @@ import (
 	"github.com/yhwyxy/AgentNexus/internal/config"
 	"github.com/yhwyxy/AgentNexus/internal/edge/httpapi"
 	"github.com/yhwyxy/AgentNexus/internal/observability"
+	"github.com/yhwyxy/AgentNexus/internal/storage/sqlite"
+	"github.com/yhwyxy/AgentNexus/migrations"
 )
 
 func Run(configPath string) error {
@@ -25,7 +27,6 @@ func Run(configPath string) error {
 	}
 
 	logger := observability.NewLogger()
-	server := httpapi.NewServer(cfg.Server.HTTPAddress)
 
 	ctx, stop := signal.NotifyContext(
 		context.Background(),
@@ -34,12 +35,35 @@ func Run(configPath string) error {
 	)
 	defer stop()
 
+	db, err := sqlite.Open(context.Background(), cfg.Database.Path)
+	if err != nil {
+		return fmt.Errorf("open database: %w", err)
+	}
+	defer db.Close()
+
+	logger.Info(
+		"database opened",
+		"database_path", cfg.Database.Path,
+	)
+
+	if err := sqlite.Migrate(ctx, db, migrations.FS); err != nil {
+		return fmt.Errorf("migrate database: %w", err)
+	}
+
+	logger.Info(
+		"database migrations applied",
+		"database_path", cfg.Database.Path,
+	)
+
+	server := httpapi.NewServer(cfg.Server.HTTPAddress)
+
 	serverErr := make(chan error, 1)
 
 	go func() {
 		logger.Info(
 			"HTTP server starting",
 			"http_address", cfg.Server.HTTPAddress,
+			"database_path", cfg.Database.Path,
 		)
 		serverErr <- server.ListenAndServe()
 	}()
