@@ -13,10 +13,12 @@ const (
 	defaultConfigPath      = "configs/agentnexus.yaml"
 	defaultHTTPAddress     = ":8080"
 	defaultShutdownTimeout = 15 * time.Second
+	defaultDatabasePath    = "data/agentnexus.db"
 )
 
 type Config struct {
-	Server ServerConfig `yaml:"server"`
+	Server   ServerConfig   `yaml:"server"`
+	Database DatabaseConfig `yaml:"database"`
 }
 
 type ServerConfig struct {
@@ -24,8 +26,17 @@ type ServerConfig struct {
 	ShutdownTimeout time.Duration `yaml:"-"`
 }
 
+type DatabaseConfig struct {
+	Path string `yaml:"path"`
+}
+
 type rawConfig struct {
-	Server rawServerConfig `yaml:"server"`
+	Server   rawServerConfig   `yaml:"server"`
+	Database rawDatabaseConfig `yaml:"database"`
+}
+
+type rawDatabaseConfig struct {
+	Path string `yaml:"path"`
 }
 
 type rawServerConfig struct {
@@ -61,6 +72,9 @@ func defaultConfig() Config {
 			HTTPAddress:     defaultHTTPAddress,
 			ShutdownTimeout: defaultShutdownTimeout,
 		},
+		Database: DatabaseConfig{
+			Path: defaultDatabasePath,
+		},
 	}
 }
 
@@ -92,6 +106,10 @@ func loadYAML(path string, cfg *Config) error {
 		cfg.Server.ShutdownTimeout = timeout
 	}
 
+	if raw.Database.Path != "" {
+		cfg.Database.Path = raw.Database.Path
+	}
+
 	return nil
 }
 
@@ -110,6 +128,10 @@ func loadEnvironment(cfg *Config) error {
 
 		cfg.Server.ShutdownTimeout = timeout
 	}
+
+	if value := os.Getenv("AGENTNEXUS_DATABASE_PATH"); value != "" {
+		cfg.Database.Path = value
+	}
 	return nil
 }
 
@@ -120,6 +142,10 @@ func validate(cfg Config) error {
 
 	if cfg.Server.ShutdownTimeout <= 0 {
 		return fmt.Errorf("server.shutdownTimeout must be greater than zero")
+	}
+
+	if cfg.Database.Path == "" {
+		return fmt.Errorf("database.path must not be empty")
 	}
 
 	return nil

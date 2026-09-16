@@ -2,3 +2,6 @@
 server:
   httpAddress: ":8080"
   shutdownTimeout: 15s
+
+database:
+  path: "data/agentnexus.db"
