@@ -1,17 +1,31 @@
-// AgentNexus HTTP Server
+// AgentNexus HTTP Server：路由装配与进程级 http.Server。
 package httpapi
 
-import "net/http"
+import (
+	"log/slog"
+	"net/http"
+)
 
-func NewServer(address string) *http.Server {
+// NewHandler 装配全部 HTTP 路由。logger 为 nil 时使用 slog.Default()。
+func NewHandler(registry ServerRegistry, logger *slog.Logger) http.Handler {
+	if logger == nil {
+		logger = slog.Default()
+	}
+	servers := &serverHandler{registry: registry, logger: logger}
+
 	mux := http.NewServeMux()
-
 	mux.HandleFunc("GET /health/live", handleLive)
 	mux.HandleFunc("GET /health/ready", handleReady)
+	mux.HandleFunc("POST "+serverRoute, servers.register)
+	mux.HandleFunc("GET "+serverRoute+"/{id}", servers.get)
 
+	return mux
+}
+
+func NewServer(address string, handler http.Handler) *http.Server {
 	return &http.Server{
 		Addr:    address,
-		Handler: mux,
+		Handler: handler,
 	}
 }
 

@@ -16,6 +16,7 @@ import (
 	"github.com/yhwyxy/AgentNexus/internal/config"
 	"github.com/yhwyxy/AgentNexus/internal/edge/httpapi"
 	"github.com/yhwyxy/AgentNexus/internal/observability"
+	"github.com/yhwyxy/AgentNexus/internal/server"
 	"github.com/yhwyxy/AgentNexus/internal/storage/sqlite"
 	"github.com/yhwyxy/AgentNexus/migrations"
 )
@@ -55,7 +56,12 @@ func Run(configPath string) error {
 		"database_path", cfg.Database.Path,
 	)
 
-	server := httpapi.NewServer(cfg.Server.HTTPAddress)
+	registry := server.NewService(sqlite.NewServerRepository(db))
+
+	httpServer := httpapi.NewServer(
+		cfg.Server.HTTPAddress,
+		httpapi.NewHandler(registry, logger),
+	)
 
 	serverErr := make(chan error, 1)
 
@@ -65,7 +71,7 @@ func Run(configPath string) error {
 			"http_address", cfg.Server.HTTPAddress,
 			"database_path", cfg.Database.Path,
 		)
-		serverErr <- server.ListenAndServe()
+		serverErr <- httpServer.ListenAndServe()
 	}()
 
 	select {
@@ -84,7 +90,7 @@ func Run(configPath string) error {
 		)
 		defer cancel()
 
-		if err := server.Shutdown(shutdownCtx); err != nil {
+		if err := httpServer.Shutdown(shutdownCtx); err != nil {
 			return fmt.Errorf("shutdown HTTP server: %w", err)
 		}
 
