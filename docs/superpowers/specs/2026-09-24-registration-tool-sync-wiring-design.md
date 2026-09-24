@@ -31,7 +31,7 @@ PR-3 的 spec 明确记录了当时的妥协：「本阶段的 `ToolSyncService.
 `SyncService` 的 `runtime.Provider` 字段与构造参数替换为 `runtime.Manager`，`Sync` 内部从 `provider.Ensure` 改为 `runtimes.EnsureReady(ctx, srv)`。收益：
 
 - per-Server 串行锁与实例缓存由 Manager 统一持有，Run 与 Call 路径共享同一实例；
-- ready/degraded 与 `observedRevision` 由 Manager 写入 `server_status`，注册后状态收敛不再悬空；
+- `observedRevision` / `lastSuccessAt` / degraded 由 Manager 写入 `server_status`（见第 4 节对 phase 语义的修正）；
 - 运行时类型分发交给 Manager，`SyncService` 删除 "remote runtime provider required" 这类 provider 白名单判断（Manager 按 `Spec.Runtime.Type` 选择，未注册类型返回 `ErrProviderNotFound`）。
 
 `SyncService` 仍自行加载 Server，以保留 `enabled` 且 `DesiredState == running` 的领域前置校验（失败返回包装 `ErrInvalidTool`），并保留 revision + catalog digest 相同的幂等短路。
@@ -81,6 +81,23 @@ httpServer := httpapi.NewServer(cfg.Server.HTTPAddress, httpapi.NewHandlerWithMC
 
 `Lifecycle` 虽然是 `app` 包内类型，但它是应用层编排：只依赖 `server` 领域类型与 `tool.SyncResult`，不触碰 SQL、MCP SDK、HTTP。
 
+### 4. phase 语义修正：ready 只在快照发布后写入
+
+实现过程中发现一个跨 PR 的一致性缺口：`runtime-manager-prerequisite-design.md`（PR #6）让 `EnsureReady` 直接写 `phase=ready`，而注册触发的同步紧接着才跑。于是注册后存在一段窗口：`GET /api/v1/mcp-servers/{id}` 已经是 `ready`，但 `tools/list` 仍为空——正是本 PR 要消除的"注册后一起可用"承诺的反面。详细设计 §3.4 的状态机（`Pending ──EnsureReady──→ Starting ──Connect+Initialize──→ Ready`）与 §10.1 的终态（Catalog Reload 与 Server Ready 同时成立）都要求 ready 晚于目录构建。
+
+本 PR 统一为：
+
+- `ProviderManager.persistEnsured`（原 `persistReady`）只写观测字段（`ObservedRevision`、`LastSuccessAt`、清零失败计数），phase 仅在「应用了新 revision」或「此前 phase 为 pending/stopped/failed」时推进到 `starting`；已经是 `starting/ready/degraded` 且 revision 匹配时保持原 phase，避免 `tools/call` 路径每次 `EnsureReady` 都产生状态抖动。
+- `tool.SyncService.Sync` 在快照发布（或确认快照已是最新）之后调用 `markReady` 写 `phase=ready`；`refresh` 阶段的任何失败（Acquire / 分页 / 归一化 / 落库）都走 §9.2 的失败分支：`phase=degraded`、`consecutive_failures+1`、`message="tool sync failed"`（不泄漏后端地址），**不改写 active 快照**，旧快照继续对外可见。
+- `EnsureReady` 自身失败（runtime 层）仍由 Manager 写 degraded，`SyncService` 不重复计数。
+- `server.Status.CreateInput()` 上移到领域层（`internal/server`），替换 `runtime` 包内的同名私有助手，供两处状态写入方复用。
+
+代价：v0.1 没有后台 Reconciler，注册后首次同步若失败，Server 会停在 `degraded`（此前是"假装 ready 但无工具"）。这是刻意的：状态现在如实反映目录不可用，恢复依赖 PR-5 Reconciler 的周期重试。
+
+### 5. CLAUDE.md 刷新
+
+`CLAUDE.md` 的现状描述停留在 PR #1：写着「gateway、runtime providers、MCP SDK adapters 尚未编写」，而 #4–#7 均已合并，且缺少 `internal/tool`、`internal/runtime`、`internal/gateway`、`internal/mcpclient`、`internal/mcpadapter`、`internal/testsupport/fakemcp` 的架构说明。本 PR 一并刷新该文件（新增各包职责、注册后异步收敛的状态语义、启动/关闭顺序），避免后续 agent 会话基于过期上下文做判断。
+
 ## 验证
 
 1. `internal/app/lifecycle_test.go`（fake registry + fake syncer，确定性 channel 同步）：
@@ -90,6 +107,9 @@ httpServer := httpapi.NewServer(cfg.Server.HTTPAddress, httpapi.NewHandlerWithMC
    - `Close` 取消在飞同步并等待 worker 退出；`Close` 后 `Trigger` 为 no-op；重复 `Close` 返回 nil。
 2. `internal/app/lifecycle_integration_test.go`（真实 SQLite + `fakemcp` + 真实 `SyncService`/`ProviderManager`/MCP handler）：
    - POST 注册 → 202 且 phase 为 `pending`；轮询 GET 直到 `phase=ready`、`observedRevision=1`；
-   - 官方 SDK client 连 `/mcp` 执行 `tools/list`，看到 `backend.demo.echo`，证明注册 → 异步协调 → 快照落库 → Catalog 失效 → 聚合可见整条链路。
-3. 更新 `internal/tool/sync_integration_test.go` 与 `internal/gateway/router_integration_test.go` 改用 `runtime.NewManager(servers, remote.NewProvider())`。
-4. 提交前执行 `gofmt -l .`（无输出）、`go vet ./...`、`go build ./...`、`go test ./...`。
+   - **观察到 ready 后立即单次** `tools/list`（不重试）即看到 `backend.demo.echo`/`backend.demo.fail`，证明 ready 蕴含目录已发布，而非"稍后才会出现"。
+3. `internal/runtime/manager_test.go`：`TestEnsureReadyPhaseTransitions` 表驱动覆盖 pending/stopped/failed → starting、starting/ready/degraded 保持不变、revision 变化回到 starting。
+4. `internal/tool/sync_integration_test.go`：成功路径断言 `phase=ready` + `observedRevision=1` + `lastSuccessAt`；失败路径（关闭后端并 `Invalidate` 会话）断言旧 active 快照仍对外可见、`phase=degraded`、`consecutive_failures=1`、message 不泄漏 endpoint。
+5. 更新 `internal/tool/sync_integration_test.go` 与 `internal/gateway/router_integration_test.go` 改用 `runtime.NewManager(servers, remote.NewProvider())`。
+6. 真实进程冒烟：独立 fake 后端 + `go run ./cmd/agentnexus`，注册 → 202 pending → 首次观察到 `ready` 后立刻单次 `tools/list` 命中两个工具 → SIGTERM 优雅退出。
+7. 提交前执行 `gofmt -l .`（无输出）、`go vet ./...`、`go build ./...`、`go test ./... -count=1`（含 `-race`）。
