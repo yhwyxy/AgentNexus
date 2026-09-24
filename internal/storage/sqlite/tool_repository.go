@@ -148,7 +148,7 @@ func (r *ToolRepository) GetActiveSnapshot(ctx context.Context, serverID server.
 
 func (r *ToolRepository) loadSnapshotTools(ctx context.Context, snapshotID string, serverID server.ID) ([]tool.Definition, error) {
 	rows, err := r.db.QueryContext(ctx, `
-		SELECT a.name, t.id, t.backend_name, t.public_name, t.title, t.description,
+		SELECT a.name, t.snapshot_id, t.id, t.backend_name, t.public_name, t.title, t.description,
 			t.input_schema_json, t.output_schema_json, t.annotations_json, t.schema_digest
 		FROM tools t JOIN assets a ON a.id = t.server_asset_id
 		WHERE t.snapshot_id = ? ORDER BY t.ordinal, t.public_name`, snapshotID)
@@ -161,7 +161,7 @@ func (r *ToolRepository) loadSnapshotTools(ctx context.Context, snapshotID strin
 		var d tool.Definition
 		var input, annotations string
 		var output sql.NullString
-		if err := rows.Scan(&d.ServerName, &d.ID, &d.BackendName, &d.PublicName, &d.Title,
+		if err := rows.Scan(&d.ServerName, &d.SnapshotID, &d.ID, &d.BackendName, &d.PublicName, &d.Title,
 			&d.Description, &input, &output, &annotations, &d.SchemaDigest); err != nil {
 			return nil, fmt.Errorf("scan snapshot tool: %w", err)
 		}
@@ -181,7 +181,7 @@ func (r *ToolRepository) loadSnapshotTools(ctx context.Context, snapshotID strin
 
 func (r *ToolRepository) ListAggregated(ctx context.Context) ([]tool.Definition, error) {
 	rows, err := r.db.QueryContext(ctx, `
-		SELECT a.id, a.name, t.id, t.backend_name, t.public_name, t.title, t.description,
+		SELECT a.id, a.name, s.id, t.id, t.backend_name, t.public_name, t.title, t.description,
 			t.input_schema_json, t.output_schema_json, t.annotations_json, t.schema_digest
 		FROM tools t
 		JOIN tool_snapshots s ON s.id = t.snapshot_id AND s.state = 'active'
@@ -197,7 +197,7 @@ func (r *ToolRepository) ListAggregated(ctx context.Context) ([]tool.Definition,
 		var d tool.Definition
 		var serverID, input, annotations string
 		var output sql.NullString
-		if err := rows.Scan(&serverID, &d.ServerName, &d.ID, &d.BackendName, &d.PublicName,
+		if err := rows.Scan(&serverID, &d.ServerName, &d.SnapshotID, &d.ID, &d.BackendName, &d.PublicName,
 			&d.Title, &d.Description, &input, &output, &annotations, &d.SchemaDigest); err != nil {
 			return nil, fmt.Errorf("scan aggregated tool: %w", err)
 		}

@@ -29,6 +29,7 @@ type Definition struct {
 	OutputSchema json.RawMessage
 	Annotations  json.RawMessage
 	SchemaDigest string
+	SnapshotID   string
 }
 
 type Route struct {
