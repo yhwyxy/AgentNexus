@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this is
 
-AgentNexus is a self-hosted "Agent Capability Control Plane" written in Go. v0.1 is an MCP gateway/aggregator: register backend MCP servers (remote streamable HTTP, stdio process, Docker), health-check them, aggregate their `tools/list`, and route `tools/call` through a single `/mcp` endpoint using `serverName.toolName` public names. Implemented so far: config/bootstrap, SQLite storage and migrations, the MCP Server domain model/service/repository, Tool snapshots + catalog + sync (`internal/tool`), the runtime `ProviderManager` with the remote provider (`internal/runtime`), the MCP client session manager (`internal/mcpclient`), the MCP SDK adapter (`internal/mcpadapter`), the virtual MCP server + router (`internal/gateway`), and the app wiring/lifecycle/reconciler (`internal/app`: registration-triggered sync, startup replay, periodic sweep, `POST ...:refresh-tools`). Not written yet: Process/Docker runtime providers, `internal/auth`, `internal/audit`, metrics, and health probing (convergence is driven by registration, refresh, and the sweep - there is no active backend health check yet).
+AgentNexus is a self-hosted "Agent Capability Control Plane" written in Go. v0.1 is an MCP gateway/aggregator: register backend MCP servers (remote streamable HTTP, stdio process, Docker), health-check them, aggregate their `tools/list`, and route `tools/call` through a single `/mcp` endpoint using `serverName.toolName` public names. Implemented so far: config/bootstrap, SQLite storage and migrations, the MCP Server domain model/service/repository, Tool snapshots + catalog + sync (`internal/tool`), the runtime `ProviderManager` with the remote and process providers (`internal/runtime`), the MCP client session manager (`internal/mcpclient`), the MCP SDK adapter (`internal/mcpadapter`), the virtual MCP server + router (`internal/gateway`), and the app wiring/lifecycle/reconciler (`internal/app`: registration-triggered sync, startup replay, periodic sweep, `POST ...:refresh-tools`). Not written yet: the Docker runtime provider, `internal/auth`, `internal/audit`, metrics, and health probing (convergence is driven by registration, refresh, and the sweep - there is no active backend health check yet).
 
 Module: `github.com/yhwyxy/AgentNexus`, Go 1.27. Dependencies are deliberately few: `modernc.org/sqlite` (pure Go, no cgo), `go.yaml.in/yaml/v3`, the official `github.com/modelcontextprotocol/go-sdk`, plus `github.com/google/uuid` (IDs) and `golang.org/x/sync` (singleflight in the catalog cache). HTTP routing uses `net/http` method patterns (`"GET /health/live"`); tests use only the standard `testing` package.
 
@@ -30,6 +30,7 @@ go run ./cmd/agentnexus -config other.yaml
 AGENTNEXUS_HTTP_ADDRESS=:9000 AGENTNEXUS_DATABASE_PATH=/tmp/an.db go run ./cmd/agentnexus
 curl localhost:8080/health/live             # {"status":"ok"}; /health/ready is identical for now
 curl -s -X POST localhost:8080/api/v1/mcp-servers -d '{"name":"weather","transport":"streamable_http","runtime":{"type":"remote","remote":{"endpoint":"http://weather-mcp:8080/mcp"}}}'   # 202 + Location
+curl -s -X POST localhost:8080/api/v1/mcp-servers -d '{"name":"local-add","transport":"stdio","runtime":{"type":"process","process":{"command":"/abs/path/to/mcp-server","args":[],"env":{"K":"V"},"workingDir":"/abs/dir"}}}'   # stdio child; command must be an absolute path
 curl -s localhost:8080/api/v1/mcp-servers/<id>   # 200; 404 for unknown id
 curl -s -X POST localhost:8080/api/v1/mcp-servers/<id>:refresh-tools   # 202; 409 if not enabled/running
 # status.phase converges asynchronously: pending -> starting (runtime up) -> ready (tool snapshot published)
@@ -68,7 +69,10 @@ edge (HTTP / MCP handlers) → application service → domain interfaces → ada
 config.Load -> JSON slog logger -> sqlite.Open -> sqlite.Migrate(ctx, db, migrations.FS)
   -> sqlite.NewServerRepository / sqlite.NewToolRepository
   -> server.NewService (registry)
-  -> runtime.NewManager(servers, remote.NewProvider())
+  -> runtime.NewManager(servers, remote.NewProvider(), process.NewProvider(ctx))
+     # ctx 是 NotifyContext。正常退出走分阶段关闭(defer runtimes.Close -> Provider.Close,
+     # 按进程组 SIGTERM,宽限后 SIGKILL);ctx 取消只是兜底(exec 默认 Cancel 只 SIGKILL 直接子进程)。
+     # 因为 defer 后进先出,runtimes.Close 先于 clients.Close,stop() 最后。
   -> mcpclient.NewManager(mcpadapter.NewConnector())
   -> tool.NewCatalog(toolRepo) + tool.NewSyncService(servers, runtimes, clients, toolRepo, catalog)
   -> gateway.NewToolCaller + gateway.NewVirtualServer -> mcpserver.NewHandler (SDK adapter)
@@ -77,11 +81,11 @@ config.Load -> JSON slog logger -> sqlite.Open -> sqlite.Migrate(ctx, db, migrat
      # the startup replay + periodic sweep (reconciler.go)
   -> httpapi.NewHandler(httpapi.Options{Registry: lifecycle, Refresher: lifecycle, MCP: mcpHandler, Logger: logger})
      wrapped by httpapi.NewServer
-  -> block until SIGINT/SIGTERM -> httpServer.Shutdown -> deferred lifecycle.Close,
-     clients.Close, db.Close
+  -> block until SIGINT/SIGTERM -> httpServer.Shutdown -> deferred runtimes.Close,
+     lifecycle.Close, clients.Close, db.Close
 ```
 
-Shutdown order matters: stop accepting registrations first, then cancel/wait the sync worker and the reconciler (bounded by `shutdownTimeout`), then close MCP sessions, then the database. A migration failure prevents the HTTP server from starting.
+Shutdown order matters: stop accepting registrations first, then cancel/wait the sync worker and the reconciler (bounded by `shutdownTimeout`), then stop runtime instances (process children: SIGTERM to the process group, then SIGKILL after the grace period), then close MCP sessions, then the database. A migration failure prevents the HTTP server from starting.
 
 Registry, startup replay, periodic sweep, and `:refresh-tools` all feed the same FIFO queue consumed by one worker, so a single server is never synced concurrently and a duplicate trigger while a sync is in flight is dropped (the next sweep retries). The replay is unconditional, the sweep only retries servers that are not converged (`phase != ready`, `observedRevision != revision`, or `consecutiveFailures > 0`), so a healthy server is not re-listed every tick. `SyncService.Sync` itself short-circuits when `revision` + `catalogDigest` are unchanged, so a replay of an untouched server costs one `tools/list` and no snapshot write.
 
@@ -117,26 +121,28 @@ Registry, startup replay, periodic sweep, and `:refresh-tools` all feed the same
 - Idempotent short-circuit: when the active snapshot already matches both `revision` and `catalog_digest`, the snapshot and the catalog cache are left untouched and only the status is refreshed.
 - Public names are always `serverName.toolName` resolved through the stored mapping (`ResolvePublicName` / `CatalogSnapshot.ByName`), never by splitting the string.
 
-### Runtime (`internal/runtime`, `internal/runtime/remote`)
+### Runtime (`internal/runtime`, `internal/runtime/remote`, `internal/runtime/process`)
 
-- A `Provider` only starts/stops/inspects an instance. `Manager` (`EnsureReady`, `Stop`, `Reconcile`) owns per-server mutual exclusion (`keyedLocker`), the in-memory instance cache, and `server_status` convergence. Instances are never persisted (the database keeps configuration and observed status only).
+- A `Provider` only starts/stops/inspects an instance. `Manager` (`EnsureReady`, `Stop`, `Reconcile`) owns per-server mutual exclusion (`keyedLocker`), the in-memory instance cache, and `server_status` convergence. Instances are never persisted (the database keeps configuration and observed status only). `(*ProviderManager).Close` stops every active instance and then calls the provider's `Releaser` (declared as `defer` in `app.Run` after `lifecycle` so it runs before `clients.Close`).
 - Provider errors are sanitized into a fixed message (`runtime ensure failed`) before being stored, so endpoints/credentials never reach `server_status`; the original error is still returned to the caller.
-- `internal/runtime/remote` is the only implemented provider (streamable HTTP); process/docker are planned. `gateway` (call path) and `tool` (refresh path) share one `Manager`, so both reuse the same instance per server.
+- `internal/runtime/remote` speaks streamable HTTP; `internal/runtime/process` runs local stdio children. `gateway` (call path) and `tool` (refresh path) share one `Manager`, so both reuse the same instance per server.
+- Process semantics: the provider owns the child (`exec.CommandContext` with the application ctx, `Setpgid` so `Stop` signals the whole group, no shell), the pipes (stdin/stdout) and stderr as a bounded ring buffer surfaced by `Logs` (snapshot semantics; `Follow` is rejected until implemented). MCP owns stdin/stdout, so child logs must go to stderr. Sessions borrow `runtime.Streams{Stdin,Stdout}` wrappers whose `Close` only marks "this connection ended" - it never closes the child's fds. A closed stream (or an exited child) makes `Inspect` fail with `ErrInstanceUnavailable`, which is the manager's reap trigger: `Stop` (kill) then `Ensure` (new pid). Instance IDs embed the pid, so a restarted backend gets new session-cache keys.
+- `Inspect` returning an error is the *only* way the manager learns an instance is gone; never close the fds from the adapter or the gateway.
 
 ### Gateway and MCP adapters (`internal/gateway`, `internal/mcpclient`, `internal/mcpadapter`)
 
 - `gateway.NewVirtualServer(catalog, caller)` exposes the aggregated catalog as a single MCP server and routes `tools/call` by looking the public name up in the catalog, then calling the backend through `mcpclient`.
-- `mcpclient` is the domain-facing session layer: `Manager.Acquire(server, instance)` returns a `SessionLease` keyed by server/revision/instance ID (bounded by `maxInFlight`), `Invalidate` drops sessions after connection failures, `Close` drains everything. It depends only on `runtime.ConnectTarget`.
-- `mcpadapter` is the only place touching the official SDK: `mcpadapter.NewConnector()` (client side) and `mcpadapter/server` (server side, backing the `/mcp` endpoint).
+- `mcpclient` is the domain-facing session layer: `Manager.Acquire(server, instance)` returns a `SessionLease` keyed by server/revision/instance ID (bounded by `maxInFlight`), `Invalidate` drops sessions after connection failures, `Close` drains everything. `Acquire` also closes and drops the sessions of other instances of the same server, so a restarted backend cannot leave a stale session behind. It depends only on `runtime.ConnectTarget`.
+- `mcpadapter` is the only place touching the official SDK: `mcpadapter.NewConnector()` (client side) and `mcpadapter/server` (server side, backing the `/mcp` endpoint). `Connector.Connect` accepts `streamable_http` (needs `URL`) and `stdio` (needs `Target.Streams`, wrapped as `mcp.IOTransport`); anything else is `unsupported MCP target`. The adapter never kills processes - closing the session only closes the stream wrappers, and the manager reaps the instance afterwards.
 
 ### App wiring (`internal/app`)
 
 - `app.Run` is the composition root. It also runs `Lifecycle`, which decorates the `ServerRegistry` handed to the HTTP layer: a successful `Register` enqueues the new ID (FIFO queue + dedup set, one worker goroutine) and the sync runs asynchronously on the application context, so the response stays `202`/`pending` and sync failures are only logged. `Lifecycle.Close` stops accepting triggers, cancels in-flight syncs and waits for the worker.
-- A failed sync leaves the server `degraded` with no automatic retry until something triggers another sync (the periodic Reconciler is still to come).
+- A failed sync leaves the server `degraded` with the previous snapshot still readable; the periodic sweep retries it, and `POST ...:refresh-tools` triggers it immediately.
 
 ### Package layout (from the detailed design)
 
-Done: `internal/tool`, `internal/runtime/{remote}`, `internal/mcpclient`, `internal/mcpadapter`, `internal/gateway`. Planned: `internal/runtime/{process,docker}`, `internal/auth`, `internal/audit`. Place new code in these packages rather than inventing new top-level ones.
+Done: `internal/tool`, `internal/runtime/{remote,process}`, `internal/mcpclient`, `internal/mcpadapter`, `internal/gateway`. Planned: `internal/runtime/docker`, `internal/auth`, `internal/audit`. Place new code in these packages rather than inventing new top-level ones.
 
 ## Conventions
 

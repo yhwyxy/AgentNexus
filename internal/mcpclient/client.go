@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"strings"
 	"sync"
 
 	"github.com/yhwyxy/AgentNexus/internal/runtime"
@@ -83,6 +84,7 @@ func (m *SessionManager) Acquire(ctx context.Context, srv server.Server, instanc
 		m.mu.Unlock()
 		return nil, fmt.Errorf("session manager is closed")
 	}
+	m.pruneOtherInstancesLocked(srv.ID, instance.ID)
 	e := m.entries[key]
 	if e == nil {
 		m.mu.Unlock()
@@ -136,15 +138,45 @@ func (l *lease) Release() {
 	})
 }
 
+// Invalidate 关闭该 Server 的全部 session(改版、手工重启、不可恢复错误)。
 func (m *SessionManager) Invalidate(serverID server.ID, _ error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	for key, e := range m.entries {
-		if len(key) > len(serverID) && key[:len(serverID)] == string(serverID) && key[len(serverID)] == '/' {
-			delete(m.entries, key)
-			_ = e.session.Close()
+		if parts := sessionKeyParts(key); parts.serverID != string(serverID) {
+			continue
 		}
+		delete(m.entries, key)
+		_ = e.session.Close()
 	}
+}
+
+// pruneOtherInstancesLocked 关闭同一 Server 下其它实例的 session。
+// 运行实例被替换(进程重启、remote 重建)后旧 session 已指向失效目标,
+// 既不能复用也不该常驻。调用方必须持有 m.mu。
+func (m *SessionManager) pruneOtherInstancesLocked(serverID server.ID, instanceID string) {
+	for key, e := range m.entries {
+		parts := sessionKeyParts(key)
+		if parts.serverID != string(serverID) || parts.instanceID == instanceID {
+			continue
+		}
+		delete(m.entries, key)
+		_ = e.session.Close()
+	}
+}
+
+type sessionKey struct {
+	serverID   string
+	revision   string
+	instanceID string
+}
+
+func sessionKeyParts(key string) sessionKey {
+	parts := strings.SplitN(key, "/", 3)
+	if len(parts) != 3 {
+		return sessionKey{serverID: key}
+	}
+	return sessionKey{serverID: parts[0], revision: parts[1], instanceID: parts[2]}
 }
 
 func (m *SessionManager) Close(_ context.Context) error {

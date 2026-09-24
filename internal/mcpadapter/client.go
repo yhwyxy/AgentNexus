@@ -10,6 +10,7 @@ import (
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 	"github.com/yhwyxy/AgentNexus/internal/mcpclient"
 	"github.com/yhwyxy/AgentNexus/internal/runtime"
+	"github.com/yhwyxy/AgentNexus/internal/server"
 )
 
 type Connector struct {
@@ -22,9 +23,30 @@ func NewConnector() *Connector {
 }
 
 func (c *Connector) Connect(ctx context.Context, target runtime.ConnectTarget) (mcpclient.Session, error) {
-	if target.Transport != "streamable_http" || target.URL == "" {
+	switch target.Transport {
+	case string(server.TransportStreamableHTTP):
+		if target.URL == "" {
+			return nil, fmt.Errorf("unsupported MCP target: streamable_http requires a URL")
+		}
+		return c.connectHTTP(ctx, target)
+	case string(server.TransportStdio):
+		if target.Streams == nil || target.Streams.Stdin == nil || target.Streams.Stdout == nil {
+			return nil, fmt.Errorf("unsupported MCP target: stdio requires process streams")
+		}
+		// 标准流由进程 Provider 持有;session Close 只会关闭这两层包装,
+		// 子进程的回收由 ProviderManager 的 Inspect 失败路径负责。
+		transport := &mcp.IOTransport{Reader: target.Streams.Stdout, Writer: target.Streams.Stdin}
+		session, err := c.ImplementationClient().Connect(ctx, transport, nil)
+		if err != nil {
+			return nil, fmt.Errorf("initialize MCP session: %w", err)
+		}
+		return &sessionAdapter{session: session}, nil
+	default:
 		return nil, fmt.Errorf("unsupported MCP target")
 	}
+}
+
+func (c *Connector) connectHTTP(ctx context.Context, target runtime.ConnectTarget) (mcpclient.Session, error) {
 	client := c.HTTPClient
 	if client == nil {
 		client = http.DefaultClient

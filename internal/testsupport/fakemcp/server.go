@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"strconv"
 	"sync"
 	"time"
 
@@ -23,31 +25,60 @@ type Server struct {
 
 func New() *Server {
 	fake := &Server{}
-	fake.server = mcp.NewServer(&mcp.Implementation{Name: "agentnexus-fake", Version: "1.0.0"}, nil)
-	// 统计 tools/list 次数：调用方需要验证"确实重新拉取了目录"，
-	// 而不是复用了已有快照。
-	fake.server.AddReceivingMiddleware(func(next mcp.MethodHandler) mcp.MethodHandler {
-		return func(ctx context.Context, method string, req mcp.Request) (mcp.Result, error) {
-			if method == "tools/list" {
-				fake.recordList()
-			}
-			return next(ctx, method, req)
+	fake.server = newMCPServer(func(method string) {
+		switch method {
+		case "tools/list":
+			fake.recordList()
+		case "tools/call":
+			fake.recordCall()
 		}
-	})
-	mcp.AddTool(fake.server, &mcp.Tool{Name: "demo.echo", Description: "returns the supplied message"}, func(_ context.Context, _ *mcp.CallToolRequest, args struct {
-		Message string `json:"message"`
-	}) (*mcp.CallToolResult, any, error) {
-		fake.recordCall()
-		return &mcp.CallToolResult{Content: []mcp.Content{&mcp.TextContent{Text: args.Message}}}, nil, nil
-	})
-	mcp.AddTool(fake.server, &mcp.Tool{Name: "demo.fail", Description: "returns a tool error"}, func(_ context.Context, _ *mcp.CallToolRequest, _ struct{}) (*mcp.CallToolResult, any, error) {
-		fake.recordCall()
-		return nil, nil, fmt.Errorf("fake tool failure")
 	})
 	handler := mcp.NewStreamableHTTPHandler(func(*http.Request) *mcp.Server { return fake.server }, nil)
 	fake.handler = handler
 	fake.HTTP = httptest.NewServer(handler)
 	return fake
+}
+
+// ServeStdio 在 stdin/stdout 上运行与 HTTP fake 相同的工具集,日志走 stderr。
+// 供"子进程方式的 stdio 后端"使用:调用方通常直接 os.Exit(0),避免 testing
+// 框架往 stdout 打印内容破坏 MCP 协议。
+//
+// 设置 AGENTNEXUS_FAKE_STDIO_PIDFILE 时会把自身 pid 写进去,便于集成测试验证
+// 子进程确实被回收。
+func ServeStdio(ctx context.Context) error {
+	if path := os.Getenv("AGENTNEXUS_FAKE_STDIO_PIDFILE"); path != "" {
+		if err := os.WriteFile(path, []byte(strconv.Itoa(os.Getpid())), 0o600); err != nil {
+			return fmt.Errorf("write fake stdio pid file: %w", err)
+		}
+	}
+	fmt.Fprintln(os.Stderr, "fakemcp stdio ready")
+	return newMCPServer(func(string) {}).Run(ctx, &mcp.StdioTransport{})
+}
+
+// newMCPServer 注册确定性工具集,并通过 record 回调上报 tools/list、tools/call 次数。
+func newMCPServer(record func(method string)) *mcp.Server {
+	server := mcp.NewServer(&mcp.Implementation{Name: "agentnexus-fake", Version: "1.0.0"}, nil)
+	// 统计 tools/list 次数:调用方需要验证"确实重新拉取了目录",
+	// 而不是复用了已有快照。
+	server.AddReceivingMiddleware(func(next mcp.MethodHandler) mcp.MethodHandler {
+		return func(ctx context.Context, method string, req mcp.Request) (mcp.Result, error) {
+			if method == "tools/list" {
+				record("tools/list")
+			}
+			return next(ctx, method, req)
+		}
+	})
+	mcp.AddTool(server, &mcp.Tool{Name: "demo.echo", Description: "returns the supplied message"}, func(_ context.Context, _ *mcp.CallToolRequest, args struct {
+		Message string `json:"message"`
+	}) (*mcp.CallToolResult, any, error) {
+		record("tools/call")
+		return &mcp.CallToolResult{Content: []mcp.Content{&mcp.TextContent{Text: args.Message}}}, nil, nil
+	})
+	mcp.AddTool(server, &mcp.Tool{Name: "demo.fail", Description: "returns a tool error"}, func(_ context.Context, _ *mcp.CallToolRequest, _ struct{}) (*mcp.CallToolResult, any, error) {
+		record("tools/call")
+		return nil, nil, fmt.Errorf("fake tool failure")
+	})
+	return server
 }
 
 func (s *Server) AddSlowTool() {
