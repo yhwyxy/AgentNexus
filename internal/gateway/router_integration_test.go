@@ -50,11 +50,11 @@ func TestStreamableMCPGatewayListsValidatesAndCallsBackend(t *testing.T) {
 	catalog := tool.NewCatalog(toolRepo)
 	clients := mcpclient.NewManager(mcpadapter.NewConnector())
 	defer clients.Close(ctx)
-	if _, err := tool.NewSyncService(servers, remote.NewProvider(), clients, toolRepo, catalog).Sync(ctx, registered.ID); err != nil {
-		t.Fatal(err)
-	}
 	runtimes, err := runtime.NewManager(servers, remote.NewProvider())
 	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tool.NewSyncService(servers, runtimes, clients, toolRepo, catalog).Sync(ctx, registered.ID); err != nil {
 		t.Fatal(err)
 	}
 	caller, err := gateway.NewToolCaller(catalog, servers, runtimes, clients)

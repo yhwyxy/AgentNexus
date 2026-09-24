@@ -23,16 +23,16 @@ type SyncResult struct {
 
 type SyncService struct {
 	servers   server.Repository
-	provider  runtime.Provider
+	runtimes  runtime.Manager
 	clients   mcpclient.Manager
 	snapshots Repository
 	catalog   CatalogInvalidator
 	newID     func() string
 }
 
-func NewSyncService(servers server.Repository, provider runtime.Provider, clients mcpclient.Manager, snapshots Repository, catalog CatalogInvalidator) *SyncService {
+func NewSyncService(servers server.Repository, runtimes runtime.Manager, clients mcpclient.Manager, snapshots Repository, catalog CatalogInvalidator) *SyncService {
 	return &SyncService{
-		servers: servers, provider: provider, clients: clients,
+		servers: servers, runtimes: runtimes, clients: clients,
 		snapshots: snapshots, catalog: catalog, newID: uuid.NewString,
 	}
 }
@@ -50,14 +50,34 @@ func (s *SyncService) Sync(ctx context.Context, id server.ID) (SyncResult, error
 	if !srv.Enabled || srv.Spec.DesiredState != server.DesiredRunning {
 		return SyncResult{}, fmt.Errorf("%w: server must be enabled and desired running", ErrInvalidTool)
 	}
-	if s.provider == nil || s.provider.Type() != server.RuntimeRemote || srv.Spec.Runtime.Type != server.RuntimeRemote {
-		return SyncResult{}, fmt.Errorf("%w: remote runtime provider required", ErrInvalidTool)
+	// 运行时类型分发与实例缓存由 RuntimeManager 负责；此处只按 Server 的
+	// connect 超时给 Ensure/Acquire 设界，避免后端无响应时占住调用方。
+	connectCtx := ctx
+	if timeout := srv.Spec.Timeouts.Connect; timeout > 0 {
+		var cancel context.CancelFunc
+		connectCtx, cancel = context.WithTimeout(ctx, timeout)
+		defer cancel()
 	}
-	instance, err := s.provider.Ensure(ctx, srv)
+	// EnsureReady 只在运行态推进到 starting；其失败路径已由 RuntimeManager
+	// 写入 degraded，因此这里不再重复写状态。
+	instance, err := s.runtimes.EnsureReady(connectCtx, srv)
 	if err != nil {
-		return SyncResult{}, fmt.Errorf("ensure remote runtime for tool sync: %w", err)
+		return SyncResult{}, fmt.Errorf("ensure runtime for tool sync: %w", err)
 	}
-	lease, err := s.clients.Acquire(ctx, srv, instance)
+	result, err := s.refresh(ctx, connectCtx, srv, instance)
+	if err != nil {
+		return SyncResult{}, s.recordFailure(ctx, srv, err)
+	}
+	// §9.2/§10.1：Catalog Reload 完成、快照已对外可见后才写 ready。
+	if err := s.markReady(ctx, srv, instance); err != nil {
+		return SyncResult{}, err
+	}
+	return result, nil
+}
+
+// refresh 拉取并发布快照，不写 Server 状态，由调用方按结果统一收敛。
+func (s *SyncService) refresh(ctx context.Context, connectCtx context.Context, srv server.Server, instance runtime.Instance) (SyncResult, error) {
+	lease, err := s.clients.Acquire(connectCtx, srv, instance)
 	if err != nil {
 		return SyncResult{}, fmt.Errorf("acquire MCP session for tool sync: %w", err)
 	}
@@ -88,6 +108,35 @@ func (s *SyncService) Sync(ctx context.Context, id server.ID) (SyncResult, error
 	}
 	s.catalog.Invalidate()
 	return SyncResult{Snapshot: replacement, Changed: true}, nil
+}
+
+// markReady 在快照发布后把 Server 置为 ready。失败不会改写已发布快照，
+// 旧 active 快照保持对外可见。
+func (s *SyncService) markReady(ctx context.Context, srv server.Server, instance runtime.Instance) error {
+	now := time.Now().UTC()
+	status := srv.Status.CreateInput()
+	status.Phase = server.PhaseReady
+	status.Message = ""
+	status.ObservedRevision = instance.ObservedRevision
+	status.LastSuccessAt = &now
+	status.ConsecutiveFailures = 0
+	if err := s.servers.UpdateStatus(ctx, srv.ID, status); err != nil {
+		return fmt.Errorf("persist ready tool sync status: %w", err)
+	}
+	return nil
+}
+
+// recordFailure 对应 §9.2 的失败分支：phase=degraded、consecutive_failures+1，
+// 且不泄漏后端错误细节（错误原文只回给调用方）。
+func (s *SyncService) recordFailure(ctx context.Context, srv server.Server, cause error) error {
+	status := srv.Status.CreateInput()
+	status.Phase = server.PhaseDegraded
+	status.Message = "tool sync failed"
+	status.ConsecutiveFailures++
+	if err := s.servers.UpdateStatus(ctx, srv.ID, status); err != nil {
+		return errors.Join(cause, fmt.Errorf("persist degraded tool sync status: %w", err))
+	}
+	return cause
 }
 
 func listAllTools(ctx context.Context, session mcpclient.Session, timeout time.Duration) ([]mcpclient.Tool, error) {

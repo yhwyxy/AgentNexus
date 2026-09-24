@@ -60,6 +60,17 @@ func Run(configPath string) error {
 	if err != nil {
 		return fmt.Errorf("create runtime manager: %w", err)
 	}
+	syncer := tool.NewSyncService(servers, runtimes, clients, toolRepo, catalog)
+	// 注册后的运行态协调与 Tool 同步在后台完成；关闭时先停止 HTTP，
+	// 再由本 defer 取消在飞同步并等待 worker 退出。
+	lifecycle := NewLifecycle(registry, syncer, logger)
+	defer func() {
+		closeCtx, cancel := context.WithTimeout(context.Background(), cfg.Server.ShutdownTimeout)
+		defer cancel()
+		if err := lifecycle.Close(closeCtx); err != nil {
+			logger.Warn("tool sync did not stop before shutdown timeout", "error", err)
+		}
+	}()
 	caller, err := gateway.NewToolCaller(catalog, servers, runtimes, clients)
 	if err != nil {
 		return fmt.Errorf("create tool caller: %w", err)
@@ -75,7 +86,7 @@ func Run(configPath string) error {
 
 	httpServer := httpapi.NewServer(
 		cfg.Server.HTTPAddress,
-		httpapi.NewHandlerWithMCP(registry, mcpHandler, logger),
+		httpapi.NewHandlerWithMCP(lifecycle, mcpHandler, logger),
 	)
 	serverErr := make(chan error, 1)
 	go func() {

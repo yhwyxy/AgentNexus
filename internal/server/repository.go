@@ -28,6 +28,19 @@ type CreateStatusInput struct {
 	ConsecutiveFailures int
 }
 
+// CreateInput 把当前观测状态转换为 UpdateStatus 的输入，供状态写入方
+// （RuntimeManager、Tool 同步）在保留未改动字段的前提下覆盖部分字段。
+func (s Status) CreateInput() CreateStatusInput {
+	return CreateStatusInput{
+		Phase:               s.Phase,
+		Message:             s.Message,
+		ObservedRevision:    s.ObservedRevision,
+		LastHealthAt:        s.LastHealthAt,
+		LastSuccessAt:       s.LastSuccessAt,
+		ConsecutiveFailures: s.ConsecutiveFailures,
+	}
+}
+
 // Repository 是 Server 持久化的领域接口。
 // 实现位于 adapter 层（internal/storage/sqlite）；本接口不得引入
 // SQL、MCP SDK、HTTP 或 Docker SDK 类型。
