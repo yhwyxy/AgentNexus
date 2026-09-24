@@ -38,3 +38,9 @@ type Provider interface {
 	Inspect(context.Context, Instance) (Instance, error)
 	Logs(context.Context, Instance, LogOptions) (io.ReadCloser, error)
 }
+
+type Manager interface {
+	EnsureReady(context.Context, server.Server) (Instance, error)
+	Stop(context.Context, server.ID) error
+	Reconcile(context.Context, server.ID) error
+}
