@@ -23,16 +23,16 @@ type SyncResult struct {
 
 type SyncService struct {
 	servers   server.Repository
-	provider  runtime.Provider
+	runtimes  runtime.Manager
 	clients   mcpclient.Manager
 	snapshots Repository
 	catalog   CatalogInvalidator
 	newID     func() string
 }
 
-func NewSyncService(servers server.Repository, provider runtime.Provider, clients mcpclient.Manager, snapshots Repository, catalog CatalogInvalidator) *SyncService {
+func NewSyncService(servers server.Repository, runtimes runtime.Manager, clients mcpclient.Manager, snapshots Repository, catalog CatalogInvalidator) *SyncService {
 	return &SyncService{
-		servers: servers, provider: provider, clients: clients,
+		servers: servers, runtimes: runtimes, clients: clients,
 		snapshots: snapshots, catalog: catalog, newID: uuid.NewString,
 	}
 }
@@ -50,14 +50,19 @@ func (s *SyncService) Sync(ctx context.Context, id server.ID) (SyncResult, error
 	if !srv.Enabled || srv.Spec.DesiredState != server.DesiredRunning {
 		return SyncResult{}, fmt.Errorf("%w: server must be enabled and desired running", ErrInvalidTool)
 	}
-	if s.provider == nil || s.provider.Type() != server.RuntimeRemote || srv.Spec.Runtime.Type != server.RuntimeRemote {
-		return SyncResult{}, fmt.Errorf("%w: remote runtime provider required", ErrInvalidTool)
+	// 运行时类型分发与实例缓存由 RuntimeManager 负责；此处只按 Server 的
+	// connect 超时给 Ensure/Acquire 设界，避免后端无响应时占住调用方。
+	connectCtx := ctx
+	if timeout := srv.Spec.Timeouts.Connect; timeout > 0 {
+		var cancel context.CancelFunc
+		connectCtx, cancel = context.WithTimeout(ctx, timeout)
+		defer cancel()
 	}
-	instance, err := s.provider.Ensure(ctx, srv)
+	instance, err := s.runtimes.EnsureReady(connectCtx, srv)
 	if err != nil {
-		return SyncResult{}, fmt.Errorf("ensure remote runtime for tool sync: %w", err)
+		return SyncResult{}, fmt.Errorf("ensure runtime for tool sync: %w", err)
 	}
-	lease, err := s.clients.Acquire(ctx, srv, instance)
+	lease, err := s.clients.Acquire(connectCtx, srv, instance)
 	if err != nil {
 		return SyncResult{}, fmt.Errorf("acquire MCP session for tool sync: %w", err)
 	}

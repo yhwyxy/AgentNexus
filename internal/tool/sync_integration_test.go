@@ -9,6 +9,7 @@ import (
 
 	"github.com/yhwyxy/AgentNexus/internal/mcpadapter"
 	"github.com/yhwyxy/AgentNexus/internal/mcpclient"
+	"github.com/yhwyxy/AgentNexus/internal/runtime"
 	"github.com/yhwyxy/AgentNexus/internal/runtime/remote"
 	"github.com/yhwyxy/AgentNexus/internal/server"
 	"github.com/yhwyxy/AgentNexus/internal/storage/sqlite"
@@ -45,8 +46,12 @@ func TestSyncPersistsAndCachesFakeMCPTools(t *testing.T) {
 	catalog := tool.NewCatalog(toolRepo).WithClock(func() time.Time { return time.Date(2026, 9, 24, 0, 0, 0, 0, time.UTC) })
 	manager := mcpclient.NewManager(mcpadapter.NewConnector())
 	defer manager.Close(ctx)
+	runtimes, err := runtime.NewManager(servers, remote.NewProvider())
+	if err != nil {
+		t.Fatal(err)
+	}
 	nextID := 0
-	syncer := tool.NewSyncService(servers, remote.NewProvider(), manager, toolRepo, catalog).WithIDGenerator(func() string {
+	syncer := tool.NewSyncService(servers, runtimes, manager, toolRepo, catalog).WithIDGenerator(func() string {
 		nextID++
 		return "id-" + strconv.Itoa(nextID)
 	})
