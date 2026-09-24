@@ -95,7 +95,7 @@ func (m *ProviderManager) ensureLoaded(ctx context.Context, srv server.Server) (
 			inspected, err := cached.provider.Inspect(ctx, cached.instance)
 			if err == nil && validInstance(inspected, srv, cached.provider) && inspected.ID == cached.instance.ID {
 				m.setActive(srv.ID, managedInstance{instance: inspected, provider: cached.provider})
-				if err := m.persistReady(ctx, srv, inspected); err != nil {
+				if err := m.persistEnsured(ctx, srv, inspected); err != nil {
 					return Instance{}, err
 				}
 				return inspected, nil
@@ -129,7 +129,7 @@ func (m *ProviderManager) ensureLoaded(ctx context.Context, srv server.Server) (
 	}
 
 	m.setActive(srv.ID, managedInstance{instance: instance, provider: provider})
-	if err := m.persistReady(ctx, srv, instance); err != nil {
+	if err := m.persistEnsured(ctx, srv, instance); err != nil {
 		return Instance{}, err
 	}
 	return instance, nil
@@ -158,7 +158,7 @@ func (m *ProviderManager) stopLoaded(ctx context.Context, srv server.Server) err
 		m.deleteActive(srv.ID)
 	}
 
-	status := statusInput(srv.Status)
+	status := srv.Status.CreateInput()
 	status.Phase = server.PhaseStopped
 	status.Message = ""
 	status.ConsecutiveFailures = 0
@@ -186,22 +186,43 @@ func (m *ProviderManager) Reconcile(ctx context.Context, id server.ID) error {
 	return m.stopLoaded(ctx, srv)
 }
 
-func (m *ProviderManager) persistReady(ctx context.Context, srv server.Server, instance Instance) error {
+// persistEnsured 记录运行态观测结果（ObservedRevision/LastSuccessAt）。
+// 依据详细设计 §3.4 状态机，EnsureReady 只负责把 Server 推进到 starting；
+// ready 必须等 Tool 快照刷新成功后才由 tool.SyncService 写入，否则会出现
+// phase=ready 但 tools/list 仍为空的中间态（§10.1 的终态是 Catalog Reload
+// 与 Server Ready 同时成立）。
+func (m *ProviderManager) persistEnsured(ctx context.Context, srv server.Server, instance Instance) error {
 	now := time.Now().UTC()
-	status := statusInput(srv.Status)
-	status.Phase = server.PhaseReady
-	status.Message = ""
+	status := srv.Status.CreateInput()
 	status.ObservedRevision = instance.ObservedRevision
 	status.LastSuccessAt = &now
+	status.Message = ""
 	status.ConsecutiveFailures = 0
+	if entersStarting(srv.Status, instance) {
+		status.Phase = server.PhaseStarting
+	}
 	if err := m.servers.UpdateStatus(ctx, srv.ID, status); err != nil {
-		return fmt.Errorf("persist ready runtime status: %w", err)
+		return fmt.Errorf("persist ensured runtime status: %w", err)
 	}
 	return nil
 }
 
+// entersStarting 判断本次 Ensure 是否代表"运行态刚具备能力"：应用了新 revision，
+// 或此前状态尚未进入 starting/ready/degraded。已经 ready 的 Server 被 tools/call
+// 路径重复 Ensure 时保持 ready，不产生状态抖动。
+func entersStarting(status server.Status, instance Instance) bool {
+	if status.ObservedRevision != instance.ObservedRevision {
+		return true
+	}
+	switch status.Phase {
+	case server.PhaseStarting, server.PhaseReady, server.PhaseDegraded:
+		return false
+	}
+	return true
+}
+
 func (m *ProviderManager) recordFailure(ctx context.Context, srv server.Server, message string, cause error) error {
-	status := statusInput(srv.Status)
+	status := srv.Status.CreateInput()
 	status.Phase = server.PhaseDegraded
 	status.Message = message
 	status.ConsecutiveFailures++
@@ -209,17 +230,6 @@ func (m *ProviderManager) recordFailure(ctx context.Context, srv server.Server, 
 		return errors.Join(cause, fmt.Errorf("persist degraded runtime status: %w", err))
 	}
 	return cause
-}
-
-func statusInput(status server.Status) server.CreateStatusInput {
-	return server.CreateStatusInput{
-		Phase:               status.Phase,
-		Message:             status.Message,
-		ObservedRevision:    status.ObservedRevision,
-		LastHealthAt:        status.LastHealthAt,
-		LastSuccessAt:       status.LastSuccessAt,
-		ConsecutiveFailures: status.ConsecutiveFailures,
-	}
 }
 
 func validInstance(instance Instance, srv server.Server, provider Provider) bool {

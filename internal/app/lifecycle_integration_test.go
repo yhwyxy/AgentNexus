@@ -120,24 +120,19 @@ func TestRegisterTriggersAsyncToolSyncAndCatalogPublish(t *testing.T) {
 	}
 	defer session.Close()
 
-	var names []string
-	for {
-		listed, err := session.ListTools(ctx, nil)
-		if err != nil {
-			t.Fatalf("tools/list: %v", err)
-		}
-		names = names[:0]
-		for _, listedTool := range listed.Tools {
-			names = append(names, listedTool.Name)
-		}
-		if len(names) > 0 || time.Now().After(deadline) {
-			break
-		}
-		time.Sleep(5 * time.Millisecond)
+	// ready 必须意味着快照已经发布：ready 后立即列一次 tools/list 即可见，
+	// 不允许出现"ready 但目录为空"的中间态。
+	listed, err := session.ListTools(ctx, nil)
+	if err != nil {
+		t.Fatalf("tools/list: %v", err)
+	}
+	names := make([]string, 0, len(listed.Tools))
+	for _, listedTool := range listed.Tools {
+		names = append(names, listedTool.Name)
 	}
 	want := []string{"backend.demo.echo", "backend.demo.fail"}
 	if len(names) != len(want) || names[0] != want[0] || names[1] != want[1] {
-		t.Fatalf("aggregated tools = %v, want %v", names, want)
+		t.Fatalf("tools/list immediately after ready = %v, want %v", names, want)
 	}
 }
 

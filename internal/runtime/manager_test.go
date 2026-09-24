@@ -73,7 +73,7 @@ func TestEnsureReadyReloadsCurrentServerAndReplacesRevision(t *testing.T) {
 		t.Fatalf("after revision change: instance=%#v Ensure=%d Stop=%d", second, provider.ensureCount(), provider.stopCount())
 	}
 	stored := repo.get("server-1")
-	if stored.Status.Phase != server.PhaseReady || stored.Status.ObservedRevision != 2 || stored.Status.LastSuccessAt == nil {
+	if stored.Status.Phase != server.PhaseStarting || stored.Status.ObservedRevision != 2 || stored.Status.LastSuccessAt == nil {
 		t.Fatalf("persisted status = %#v", stored.Status)
 	}
 }
@@ -154,8 +154,48 @@ func TestEnsureReadyRetriesStatusWriteWithoutEnsuringTwice(t *testing.T) {
 	if provider.ensureCount() != 1 || provider.inspectCount() != 1 {
 		t.Fatalf("Ensure calls = %d, Inspect calls = %d; want 1 each", provider.ensureCount(), provider.inspectCount())
 	}
-	if got := repo.get("server-1").Status.Phase; got != server.PhaseReady {
-		t.Fatalf("status phase = %q, want ready", got)
+	if got := repo.get("server-1").Status.Phase; got != server.PhaseStarting {
+		t.Fatalf("status phase = %q, want starting", got)
+	}
+}
+
+// EnsureReady 只负责运行态：它不得声称 ready（ready 由 Tool 快照刷新写入），
+// 也不得把已发布的 ready 打回 starting，否则 tools/call 路径每次 Ensure 都会抖动。
+func TestEnsureReadyPhaseTransitions(t *testing.T) {
+	ctx := context.Background()
+	cases := []struct {
+		name   string
+		before server.Status
+		want   server.Phase
+	}{
+		{"pending becomes starting", server.Status{Phase: server.PhasePending}, server.PhaseStarting},
+		{"stopped becomes starting", server.Status{Phase: server.PhaseStopped, ObservedRevision: 1}, server.PhaseStarting},
+		{"failed becomes starting", server.Status{Phase: server.PhaseFailed, ObservedRevision: 1}, server.PhaseStarting},
+		{"starting stays starting", server.Status{Phase: server.PhaseStarting, ObservedRevision: 1}, server.PhaseStarting},
+		{"ready stays ready", server.Status{Phase: server.PhaseReady, ObservedRevision: 1}, server.PhaseReady},
+		{"degraded stays degraded", server.Status{Phase: server.PhaseDegraded, ObservedRevision: 1}, server.PhaseDegraded},
+		{"new revision restarts from starting", server.Status{Phase: server.PhaseReady, ObservedRevision: 0}, server.PhaseStarting},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			srv := testServer("server-1", 1)
+			srv.Status = tc.before
+			repo := newManagerRepo(srv)
+			manager, err := NewManager(repo, &testProvider{runtimeType: server.RuntimeRemote})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := manager.EnsureReady(ctx, srv); err != nil {
+				t.Fatal(err)
+			}
+			stored := repo.get("server-1").Status
+			if stored.Phase != tc.want {
+				t.Fatalf("phase = %q, want %q", stored.Phase, tc.want)
+			}
+			if stored.ObservedRevision != 1 || stored.LastSuccessAt == nil || stored.ConsecutiveFailures != 0 {
+				t.Fatalf("observed status = %#v", stored)
+			}
+		})
 	}
 }
 
