@@ -103,11 +103,21 @@ func (s *sessionAdapter) CallTool(ctx context.Context, req mcpclient.CallRequest
 	}
 	contents := make([]mcpclient.Content, 0, len(result.Content))
 	for _, content := range result.Content {
-		var text string
 		if textContent, ok := content.(*mcp.TextContent); ok {
-			text = textContent.Text
+			contents = append(contents, mcpclient.Content{Type: "text", Text: textContent.Text})
+			continue
 		}
-		contents = append(contents, mcpclient.Content{Type: "text", Text: text})
+		data, err := json.Marshal(content)
+		if err != nil {
+			return mcpclient.CallResult{}, fmt.Errorf("marshal tool content: %w", err)
+		}
+		var kind struct {
+			Type string `json:"type"`
+		}
+		if err := json.Unmarshal(data, &kind); err != nil {
+			return mcpclient.CallResult{}, fmt.Errorf("decode tool content type: %w", err)
+		}
+		contents = append(contents, mcpclient.Content{Type: kind.Type, Data: data})
 	}
 	structured, err := json.Marshal(result.StructuredContent)
 	if err != nil {
