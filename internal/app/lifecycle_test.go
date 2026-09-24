@@ -113,8 +113,16 @@ func waitForCalls(t *testing.T, syncer *fakeSyncer, want int) []server.ID {
 	return nil
 }
 
-func newTestLifecycle(syncer *fakeSyncer, registry *fakeRegistry) *app.Lifecycle {
-	lifecycle := app.NewLifecycle(registry, syncer, testLogger())
+func newTestLifecycle(t *testing.T, syncer *fakeSyncer, registry *fakeRegistry, opts ...func(*app.LifecycleOptions)) *app.Lifecycle {
+	t.Helper()
+	options := app.LifecycleOptions{Registry: registry, Syncer: syncer, Logger: testLogger()}
+	for _, apply := range opts {
+		apply(&options)
+	}
+	lifecycle, err := app.NewLifecycle(options)
+	if err != nil {
+		t.Fatalf("new lifecycle: %v", err)
+	}
 	return lifecycle
 }
 
@@ -130,7 +138,7 @@ func closeLifecycle(t *testing.T, lifecycle *app.Lifecycle) {
 func TestLifecycleSyncsAfterRegister(t *testing.T) {
 	registry := &fakeRegistry{srv: server.Server{ID: "srv-1", Name: "weather"}}
 	syncer := &fakeSyncer{started: make(chan server.ID, 1)}
-	lifecycle := newTestLifecycle(syncer, registry)
+	lifecycle := newTestLifecycle(t, syncer, registry)
 	defer closeLifecycle(t, lifecycle)
 
 	created, err := lifecycle.Register(context.Background(), server.RegisterInput{Name: "weather"})
@@ -157,7 +165,7 @@ func TestLifecycleSyncsAfterRegister(t *testing.T) {
 func TestLifecycleDoesNotSyncWhenRegisterFails(t *testing.T) {
 	registry := &fakeRegistry{err: server.ErrAlreadyExists}
 	syncer := &fakeSyncer{}
-	lifecycle := newTestLifecycle(syncer, registry)
+	lifecycle := newTestLifecycle(t, syncer, registry)
 
 	if _, err := lifecycle.Register(context.Background(), server.RegisterInput{Name: "weather"}); !errors.Is(err, server.ErrAlreadyExists) {
 		t.Fatalf("register error = %v, want ErrAlreadyExists", err)
@@ -172,7 +180,7 @@ func TestLifecycleDoesNotSyncWhenRegisterFails(t *testing.T) {
 func TestLifecycleDeduplicatesQueuedTriggers(t *testing.T) {
 	registry := &fakeRegistry{srv: server.Server{ID: "srv-1"}}
 	syncer := &fakeSyncer{started: make(chan server.ID, 8), block: make(chan struct{})}
-	lifecycle := newTestLifecycle(syncer, registry)
+	lifecycle := newTestLifecycle(t, syncer, registry)
 	defer closeLifecycle(t, lifecycle)
 
 	lifecycle.Trigger("srv-1")
@@ -199,7 +207,7 @@ func TestLifecycleCloseCancelsInFlightSyncAndStopsQueue(t *testing.T) {
 		canceled: make(chan server.ID, 1),
 		block:    make(chan struct{}),
 	}
-	lifecycle := newTestLifecycle(syncer, registry)
+	lifecycle := newTestLifecycle(t, syncer, registry)
 
 	lifecycle.Trigger("srv-1")
 	waitForID(t, syncer.started, "srv-1")
@@ -224,7 +232,7 @@ func TestLifecycleCloseCancelsInFlightSyncAndStopsQueue(t *testing.T) {
 func TestLifecycleContinuesAfterSyncFailure(t *testing.T) {
 	registry := &fakeRegistry{srv: server.Server{ID: "srv-1"}}
 	syncer := &fakeSyncer{fail: map[server.ID]error{"srv-1": errors.New("backend unreachable")}}
-	lifecycle := newTestLifecycle(syncer, registry)
+	lifecycle := newTestLifecycle(t, syncer, registry)
 	defer closeLifecycle(t, lifecycle)
 
 	lifecycle.Trigger("srv-1")

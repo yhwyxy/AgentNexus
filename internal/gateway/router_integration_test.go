@@ -125,7 +125,7 @@ func TestStreamableMCPGatewayListsValidatesAndCallsBackend(t *testing.T) {
 
 func testHTTPServer(t *testing.T, handler *mcpserver.Handler) string {
 	t.Helper()
-	mux := httpapi.NewHandlerWithMCP(nil, handler, nil)
+	mux := httpapi.NewHandler(httpapi.Options{MCP: handler})
 	httpServer := httptest.NewServer(mux)
 	t.Cleanup(httpServer.Close)
 	return httpServer.URL + "/mcp"

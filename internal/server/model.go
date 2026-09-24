@@ -109,6 +109,13 @@ type LimitSpec struct {
 	MaxInFlight int
 }
 
+// Runnable 表示该 Server 期望有运行态实例：enabled 且 desiredState=running。
+// 运行态工作（启动、Tool 同步、刷新）只对 Runnable 的 Server 有意义，
+// 该谓词是这一判定的唯一定义处。
+func (s Server) Runnable() bool {
+	return s.Enabled && s.Spec.DesiredState == DesiredRunning
+}
+
 type Status struct {
 	Phase               Phase
 	Message             string
