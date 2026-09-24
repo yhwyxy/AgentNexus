@@ -54,7 +54,16 @@ func TestRegisterTriggersAsyncToolSyncAndCatalogPublish(t *testing.T) {
 	if err != nil {
 		t.Fatalf("create runtime manager: %v", err)
 	}
-	lifecycle := app.NewLifecycle(registry, tool.NewSyncService(servers, runtimes, clients, toolRepo, catalog), testLogger())
+	lifecycle, err := app.NewLifecycle(app.LifecycleOptions{
+		Registry:          registry,
+		Syncer:            tool.NewSyncService(servers, runtimes, clients, toolRepo, catalog),
+		Lister:            servers,
+		ReconcileInterval: 10 * time.Millisecond,
+		Logger:            testLogger(),
+	})
+	if err != nil {
+		t.Fatalf("create lifecycle: %v", err)
+	}
 	defer closeLifecycle(t, lifecycle)
 
 	caller, err := gateway.NewToolCaller(catalog, servers, runtimes, clients)
@@ -69,7 +78,12 @@ func TestRegisterTriggersAsyncToolSyncAndCatalogPublish(t *testing.T) {
 	if err != nil {
 		t.Fatalf("create MCP handler: %v", err)
 	}
-	httpServer := httptest.NewServer(httpapi.NewHandlerWithMCP(lifecycle, mcpHandler, testLogger()))
+	httpServer := httptest.NewServer(httpapi.NewHandler(httpapi.Options{
+		Registry:  lifecycle,
+		Refresher: lifecycle,
+		MCP:       mcpHandler,
+		Logger:    testLogger(),
+	}))
 	defer httpServer.Close()
 
 	body := fmt.Sprintf(`{"name":"backend","transport":"streamable_http",

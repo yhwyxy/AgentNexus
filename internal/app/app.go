@@ -61,9 +61,19 @@ func Run(configPath string) error {
 		return fmt.Errorf("create runtime manager: %w", err)
 	}
 	syncer := tool.NewSyncService(servers, runtimes, clients, toolRepo, catalog)
-	// 注册后的运行态协调与 Tool 同步在后台完成；关闭时先停止 HTTP，
-	// 再由本 defer 取消在飞同步并等待 worker 退出。
-	lifecycle := NewLifecycle(registry, syncer, logger)
+	// 运行态协调在后台完成：注册触发，加上启动重放与按 reconcileInterval 的周期巡检
+	// （重启后实例缓存为空，DB 里的 ready 不代表运行态存在，必须重放）。
+	// 关闭时先停止 HTTP，再由本 defer 取消在飞同步并等待 worker 与 Reconciler 退出。
+	lifecycle, err := NewLifecycle(LifecycleOptions{
+		Registry:          registry,
+		Syncer:            syncer,
+		Lister:            servers,
+		ReconcileInterval: cfg.Runtime.ReconcileInterval,
+		Logger:            logger,
+	})
+	if err != nil {
+		return fmt.Errorf("create lifecycle: %w", err)
+	}
 	defer func() {
 		closeCtx, cancel := context.WithTimeout(context.Background(), cfg.Server.ShutdownTimeout)
 		defer cancel()
@@ -86,7 +96,12 @@ func Run(configPath string) error {
 
 	httpServer := httpapi.NewServer(
 		cfg.Server.HTTPAddress,
-		httpapi.NewHandlerWithMCP(lifecycle, mcpHandler, logger),
+		httpapi.NewHandler(httpapi.Options{
+			Registry:  lifecycle,
+			Refresher: lifecycle,
+			MCP:       mcpHandler,
+			Logger:    logger,
+		}),
 	)
 	serverErr := make(chan error, 1)
 	go func() {

@@ -10,15 +10,17 @@ import (
 )
 
 const (
-	defaultConfigPath      = "configs/agentnexus.yaml"
-	defaultHTTPAddress     = ":8080"
-	defaultShutdownTimeout = 15 * time.Second
-	defaultDatabasePath    = "data/agentnexus.db"
+	defaultConfigPath        = "configs/agentnexus.yaml"
+	defaultHTTPAddress       = ":8080"
+	defaultShutdownTimeout   = 15 * time.Second
+	defaultDatabasePath      = "data/agentnexus.db"
+	defaultReconcileInterval = 30 * time.Second
 )
 
 type Config struct {
 	Server   ServerConfig   `yaml:"server"`
 	Database DatabaseConfig `yaml:"database"`
+	Runtime  RuntimeConfig  `yaml:"runtime"`
 }
 
 type ServerConfig struct {
@@ -30,9 +32,20 @@ type DatabaseConfig struct {
 	Path string `yaml:"path"`
 }
 
+// RuntimeConfig 控制运行态收敛（详细设计 §15）：
+// 周期巡检在启动重放之后按 ReconcileInterval 重试未收敛的 Server，0 表示关闭周期行为。
+type RuntimeConfig struct {
+	ReconcileInterval time.Duration `yaml:"-"`
+}
+
 type rawConfig struct {
 	Server   rawServerConfig   `yaml:"server"`
 	Database rawDatabaseConfig `yaml:"database"`
+	Runtime  rawRuntimeConfig  `yaml:"runtime"`
+}
+
+type rawRuntimeConfig struct {
+	ReconcileInterval string `yaml:"reconcileInterval"`
 }
 
 type rawDatabaseConfig struct {
@@ -75,6 +88,9 @@ func defaultConfig() Config {
 		Database: DatabaseConfig{
 			Path: defaultDatabasePath,
 		},
+		Runtime: RuntimeConfig{
+			ReconcileInterval: defaultReconcileInterval,
+		},
 	}
 }
 
@@ -110,6 +126,15 @@ func loadYAML(path string, cfg *Config) error {
 		cfg.Database.Path = raw.Database.Path
 	}
 
+	if raw.Runtime.ReconcileInterval != "" {
+		interval, err := time.ParseDuration(raw.Runtime.ReconcileInterval)
+		if err != nil {
+			return fmt.Errorf("parse runtime.reconcileInterval: %w", err)
+		}
+
+		cfg.Runtime.ReconcileInterval = interval
+	}
+
 	return nil
 }
 
@@ -132,6 +157,17 @@ func loadEnvironment(cfg *Config) error {
 	if value := os.Getenv("AGENTNEXUS_DATABASE_PATH"); value != "" {
 		cfg.Database.Path = value
 	}
+
+	if value := os.Getenv("AGENTNEXUS_RUNTIME_RECONCILE_INTERVAL"); value != "" {
+		interval, err := time.ParseDuration(value)
+		if err != nil {
+			return fmt.Errorf(
+				"parse AGENTNEXUS_RUNTIME_RECONCILE_INTERVAL: %w", err,
+			)
+		}
+
+		cfg.Runtime.ReconcileInterval = interval
+	}
 	return nil
 }
 
@@ -146,6 +182,10 @@ func validate(cfg Config) error {
 
 	if cfg.Database.Path == "" {
 		return fmt.Errorf("database.path must not be empty")
+	}
+
+	if cfg.Runtime.ReconcileInterval < 0 {
+		return fmt.Errorf("runtime.reconcileInterval must not be negative")
 	}
 
 	return nil

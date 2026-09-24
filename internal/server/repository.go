@@ -14,6 +14,9 @@ var (
 	ErrAlreadyExists = errors.New("server already exists")
 	// ErrConflict: 乐观锁失败（expectedRevision 不匹配或行数为 0）。
 	ErrConflict = errors.New("revision conflict")
+	// ErrNotRunnable: Server 未处于期望运行态（disabled 或 desiredState=stopped），
+	// 运行态操作（如刷新 Tool 快照）此时不可执行。
+	ErrNotRunnable = errors.New("server is not runnable")
 )
 
 // CreateStatusInput 是 UpdateStatus 的输入。

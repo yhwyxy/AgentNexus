@@ -47,7 +47,7 @@ func (s *SyncService) Sync(ctx context.Context, id server.ID) (SyncResult, error
 	if err != nil {
 		return SyncResult{}, fmt.Errorf("get server for tool sync: %w", err)
 	}
-	if !srv.Enabled || srv.Spec.DesiredState != server.DesiredRunning {
+	if !srv.Runnable() {
 		return SyncResult{}, fmt.Errorf("%w: server must be enabled and desired running", ErrInvalidTool)
 	}
 	// 运行时类型分发与实例缓存由 RuntimeManager 负责；此处只按 Server 的

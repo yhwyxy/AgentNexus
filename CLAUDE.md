@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this is
 
-AgentNexus is a self-hosted "Agent Capability Control Plane" written in Go. v0.1 is an MCP gateway/aggregator: register backend MCP servers (remote streamable HTTP, stdio process, Docker), health-check them, aggregate their `tools/list`, and route `tools/call` through a single `/mcp` endpoint using `serverName.toolName` public names. Implemented so far: config/bootstrap, SQLite storage and migrations, the MCP Server domain model/service/repository, Tool snapshots + catalog + sync (`internal/tool`), the runtime `ProviderManager` with the remote provider (`internal/runtime`), the MCP client session manager (`internal/mcpclient`), the MCP SDK adapter (`internal/mcpadapter`), the virtual MCP server + router (`internal/gateway`), and the app wiring/lifecycle (`internal/app`). Not written yet: Process/Docker runtime providers, `internal/auth`, `internal/audit`, metrics, and the background Reconciler (status converges on registration and on demand, not yet periodically).
+AgentNexus is a self-hosted "Agent Capability Control Plane" written in Go. v0.1 is an MCP gateway/aggregator: register backend MCP servers (remote streamable HTTP, stdio process, Docker), health-check them, aggregate their `tools/list`, and route `tools/call` through a single `/mcp` endpoint using `serverName.toolName` public names. Implemented so far: config/bootstrap, SQLite storage and migrations, the MCP Server domain model/service/repository, Tool snapshots + catalog + sync (`internal/tool`), the runtime `ProviderManager` with the remote provider (`internal/runtime`), the MCP client session manager (`internal/mcpclient`), the MCP SDK adapter (`internal/mcpadapter`), the virtual MCP server + router (`internal/gateway`), and the app wiring/lifecycle/reconciler (`internal/app`: registration-triggered sync, startup replay, periodic sweep, `POST ...:refresh-tools`). Not written yet: Process/Docker runtime providers, `internal/auth`, `internal/audit`, metrics, and health probing (convergence is driven by registration, refresh, and the sweep - there is no active backend health check yet).
 
 Module: `github.com/yhwyxy/AgentNexus`, Go 1.27. Dependencies are deliberately few: `modernc.org/sqlite` (pure Go, no cgo), `go.yaml.in/yaml/v3`, the official `github.com/modelcontextprotocol/go-sdk`, plus `github.com/google/uuid` (IDs) and `golang.org/x/sync` (singleflight in the catalog cache). HTTP routing uses `net/http` method patterns (`"GET /health/live"`); tests use only the standard `testing` package.
 
@@ -31,10 +31,12 @@ AGENTNEXUS_HTTP_ADDRESS=:9000 AGENTNEXUS_DATABASE_PATH=/tmp/an.db go run ./cmd/a
 curl localhost:8080/health/live             # {"status":"ok"}; /health/ready is identical for now
 curl -s -X POST localhost:8080/api/v1/mcp-servers -d '{"name":"weather","transport":"streamable_http","runtime":{"type":"remote","remote":{"endpoint":"http://weather-mcp:8080/mcp"}}}'   # 202 + Location
 curl -s localhost:8080/api/v1/mcp-servers/<id>   # 200; 404 for unknown id
+curl -s -X POST localhost:8080/api/v1/mcp-servers/<id>:refresh-tools   # 202; 409 if not enabled/running
 # status.phase converges asynchronously: pending -> starting (runtime up) -> ready (tool snapshot published)
+# the startup replay and the periodic sweep (runtime.reconcileInterval) drive the same convergence loop
 ```
 
-Config precedence: built-in defaults → YAML → `AGENTNEXUS_HTTP_ADDRESS` / `AGENTNEXUS_SHUTDOWN_TIMEOUT` / `AGENTNEXUS_DATABASE_PATH` → validate. A missing YAML file is silently ignored; a present-but-invalid one is fatal. `configs/dev.yaml` currently fails validation (`shutdownTimeout: 0s`), so do not use it as-is.
+Config precedence: built-in defaults → YAML → `AGENTNEXUS_HTTP_ADDRESS` / `AGENTNEXUS_SHUTDOWN_TIMEOUT` / `AGENTNEXUS_DATABASE_PATH` / `AGENTNEXUS_RUNTIME_RECONCILE_INTERVAL` → validate. A missing YAML file is silently ignored; a present-but-invalid one is fatal. `runtime.reconcileInterval` (YAML: duration string, default 30s) sets the periodic sweep cadence; `0s` disables the sweep but keeps the startup replay. Negative values are rejected. `configs/dev.yaml` currently fails validation (`shutdownTimeout: 0s`), so do not use it as-is.
 
 Manual/phase-0 programs live in `examples/` (gitignored, so absent on a fresh clone):
 
@@ -70,13 +72,18 @@ config.Load -> JSON slog logger -> sqlite.Open -> sqlite.Migrate(ctx, db, migrat
   -> mcpclient.NewManager(mcpadapter.NewConnector())
   -> tool.NewCatalog(toolRepo) + tool.NewSyncService(servers, runtimes, clients, toolRepo, catalog)
   -> gateway.NewToolCaller + gateway.NewVirtualServer -> mcpserver.NewHandler (SDK adapter)
-  -> app.NewLifecycle(registry, syncer, logger)    # decorates the registry: sync after Register
-  -> httpapi.NewHandlerWithMCP(lifecycle, mcpHandler, logger) wrapped by httpapi.NewServer
+  -> app.NewLifecycle(LifecycleOptions{Registry, Syncer, Lister, ReconcileInterval, Logger})
+     # decorates the registry: sync after Register; Lister != nil also starts
+     # the startup replay + periodic sweep (reconciler.go)
+  -> httpapi.NewHandler(httpapi.Options{Registry: lifecycle, Refresher: lifecycle, MCP: mcpHandler, Logger: logger})
+     wrapped by httpapi.NewServer
   -> block until SIGINT/SIGTERM -> httpServer.Shutdown -> deferred lifecycle.Close,
      clients.Close, db.Close
 ```
 
-Shutdown order matters: stop accepting registrations first, then cancel/wait the sync worker (bounded by `shutdownTimeout`), then close MCP sessions, then the database. A migration failure prevents the HTTP server from starting.
+Shutdown order matters: stop accepting registrations first, then cancel/wait the sync worker and the reconciler (bounded by `shutdownTimeout`), then close MCP sessions, then the database. A migration failure prevents the HTTP server from starting.
+
+Registry, startup replay, periodic sweep, and `:refresh-tools` all feed the same FIFO queue consumed by one worker, so a single server is never synced concurrently and a duplicate trigger while a sync is in flight is dropped (the next sweep retries). The replay is unconditional, the sweep only retries servers that are not converged (`phase != ready`, `observedRevision != revision`, or `consecutiveFailures > 0`), so a healthy server is not re-listed every tick. `SyncService.Sync` itself short-circuits when `revision` + `catalogDigest` are unchanged, so a replay of an untouched server costs one `tools/list` and no snapshot write.
 
 ### Storage (`internal/storage/sqlite`, `migrations/`)
 
@@ -92,13 +99,13 @@ Shutdown order matters: stop accepting registrations first, then cancel/wait the
 - `Server` = envelope fields + `Spec` (desired config) + `Status` (observed state). `Server.Revision` is the config version; `Status.ObservedRevision` is what the runtime has applied, and a mismatch means a reconcile is needed. `Spec.DesiredState` (running/stopped) and `Status.Phase` (pending/starting/ready/degraded/stopped/failed) are different things; do not conflate them.
 - `RuntimeSpec` is a tagged union: `Type` plus exactly one non-nil payload (`Remote`, `Process`, `Docker`). Transport/runtime matrix: `streamable_http` → remote or docker; `stdio` → process or docker.
 - `Validate()` only checks and never mutates. Defaulting (namespace `default`, timeouts 5s/10s/60s, maxInFlight 16, enabled true, desired state running) happens once, in `Service.Register` in the same package, which then assigns the ID and timestamps, validates, and persists through the `Repository` interface. Validation failures wrap `ErrInvalid`; repository errors pass through unchanged. Rules: namespace/name match `^[a-z][a-z0-9-]{0,62}$` and are immutable after registration (rename = new server); remote endpoints are absolute http/https URLs with a host and no userinfo; process commands are absolute paths with args passed as `[]string` to `exec.CommandContext`, never through a shell; secrets go through `CredentialID`, never into headers, env, or URLs.
-- `Repository` sentinel errors: `ErrNotFound`, `ErrAlreadyExists`, `ErrConflict` (optimistic-lock failure when `UpdateSpec` is called with a stale `expectedRevision`).
+- `Repository` sentinel errors: `ErrNotFound`, `ErrAlreadyExists`, `ErrConflict` (optimistic-lock failure when `UpdateSpec` is called with a stale `expectedRevision`), and `ErrNotRunnable` (the server is disabled or `desiredState=stopped`, so runtime work like a tool refresh is meaningless). `Server.Runnable()` is the single definition of that predicate; the SQLite adapter's `ListEnabled` is the repository-side listing the reconciler uses.
 - `Status.Phase` has two writers, per the detailed design §3.4 state machine: `ProviderManager` records `ObservedRevision`/`LastSuccessAt` and moves the phase to `starting` (or `degraded` on runtime failure) but never claims `ready`; `tool.SyncService` writes `ready` only after the snapshot is published (or confirmed unchanged), and writes `degraded` + `consecutive_failures+1` when a refresh fails, leaving the previous `active` snapshot readable. Never write `ready` before the catalog is reloaded - `ready` means "runtime applied the current revision AND the tool catalog is published". `Status.CreateInput()` is the shared status -> `CreateStatusInput` conversion both writers use.
 
 ### HTTP API (`internal/edge/httpapi`)
 
 - `NewHandler` builds the mux and depends on a consumer-defined `ServerRegistry` interface (Register + Get), not on the concrete service. Tests inject the real service over a temp SQLite database, or a stub for failure paths.
-- Routes: `GET /health/live`, `GET /health/ready`, `POST /api/v1/mcp-servers` (202 Accepted plus `Location`, because runtime start is asynchronous by design), `GET /api/v1/mcp-servers/{id}`.
+- Routes: `GET /health/live`, `GET /health/ready`, `POST /api/v1/mcp-servers` (202 Accepted plus `Location`, because runtime start is asynchronous by design), `GET /api/v1/mcp-servers/{id}`, `POST /api/v1/mcp-servers/{id}:refresh-tools` (202, same async semantics). The action route is only registered when a `ServerRefresher` is supplied; `net/http` requires a wildcard segment to own a whole path segment, so the route is `POST .../{rest...}` and the handler splits `<id>:<action>` (`parseAction` in `mcp_server_handlers.go`). Unknown action or unknown id → 404; a non-runnable server (disabled or desired state stopped) → 409 `conflict` via `server.ErrNotRunnable`.
 - Wire format is defined by the DTOs in `dto.go`; domain types are never serialized directly. Timeouts travel as whole seconds (`connectSeconds` etc.), the runtime is a tagged union that only emits the active variant, and `desiredState` is not accepted on registration.
 - Errors use one envelope, `{"error":{"code":...,"message":...}}`, with codes `invalid_argument` (400), `not_found` (404), `conflict` (409), `internal` (500). Domain sentinels are mapped in exactly one place, `writeDomainError`. Unexpected errors are logged with detail and returned as an opaque "internal error".
 - Request bodies are capped at 1 MiB and unknown JSON fields are rejected.

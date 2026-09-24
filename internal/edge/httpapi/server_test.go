@@ -43,7 +43,10 @@ func newTestHandler(t *testing.T) http.Handler {
 		WithClock(func() time.Time { return t0 }).
 		WithIDGenerator(func() string { n++; return fmt.Sprintf("srv-%d", n) })
 
-	return httpapi.NewHandler(registry, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	return httpapi.NewHandler(httpapi.Options{
+		Registry: registry,
+		Logger:   slog.New(slog.NewTextHandler(io.Discard, nil)),
+	})
 }
 
 func do(t *testing.T, h http.Handler, method, path, body string) *httptest.ResponseRecorder {
@@ -339,10 +342,10 @@ func (f failingRegistry) Get(context.Context, server.ID) (server.Server, error) 
 
 func TestUnexpectedErrorIsOpaqueAndLogged(t *testing.T) {
 	var logs bytes.Buffer
-	h := httpapi.NewHandler(
-		failingRegistry{err: errors.New("boom: /var/lib/secret")},
-		slog.New(slog.NewTextHandler(&logs, nil)),
-	)
+	h := httpapi.NewHandler(httpapi.Options{
+		Registry: failingRegistry{err: errors.New("boom: /var/lib/secret")},
+		Logger:   slog.New(slog.NewTextHandler(&logs, nil)),
+	})
 
 	tests := []struct{ method, path, body string }{
 		{http.MethodPost, "/api/v1/mcp-servers", minimalWeather},
@@ -376,5 +379,158 @@ func TestHealthEndpoints(t *testing.T) {
 			t.Errorf("GET %s status = %d, want 200", path, rec.Code)
 		}
 		assertJSONEqual(t, rec.Body.Bytes(), `{"status":"ok"}`)
+	}
+}
+
+// fakeRefresher 记录被请求刷新的 ID，并可注入领域错误。
+type fakeRefresher struct {
+	srv  server.Server
+	err  error
+	gets []server.ID
+}
+
+func (f *fakeRefresher) RefreshTools(_ context.Context, id server.ID) (server.Server, error) {
+	f.gets = append(f.gets, id)
+	if f.err != nil {
+		return server.Server{}, f.err
+	}
+	return f.srv, nil
+}
+
+func refreshableServer() server.Server {
+	return server.Server{
+		ID:        "srv-1",
+		Namespace: "default",
+		Name:      "weather",
+		Enabled:   true,
+		Revision:  1,
+		Spec: server.Spec{
+			Transport: server.TransportStreamableHTTP,
+			Runtime: server.RuntimeSpec{
+				Type:   server.RuntimeRemote,
+				Remote: &server.RemoteSpec{Endpoint: "http://weather-mcp:8080/mcp"},
+			},
+			Timeouts:     server.TimeoutSpec{Connect: 5 * time.Second, List: 10 * time.Second, Call: 60 * time.Second},
+			Limits:       server.LimitSpec{MaxInFlight: 16},
+			DesiredState: server.DesiredRunning,
+		},
+		Status: server.Status{Phase: server.PhaseReady, ObservedRevision: 1},
+	}
+}
+
+func newRefreshHandler(refresher httpapi.ServerRefresher) http.Handler {
+	return httpapi.NewHandler(httpapi.Options{
+		Registry:  failingRegistry{err: errors.New("unused")},
+		Refresher: refresher,
+		Logger:    slog.New(slog.NewTextHandler(io.Discard, nil)),
+	})
+}
+
+// 动作路由以 202 接受：真正的拉取由后台完成，调用方通过 GET 观察状态。
+func TestRefreshToolsAccepted(t *testing.T) {
+	refresher := &fakeRefresher{srv: refreshableServer()}
+	h := newRefreshHandler(refresher)
+
+	rec := do(t, h, http.MethodPost, "/api/v1/mcp-servers/srv-1:refresh-tools", "")
+	if rec.Code != http.StatusAccepted {
+		t.Fatalf("status = %d, want 202; body: %s", rec.Code, rec.Body)
+	}
+	if got := rec.Header().Get("Location"); got != "/api/v1/mcp-servers/srv-1" {
+		t.Errorf("Location = %q, want the server self link", got)
+	}
+	assertJSONEqual(t, rec.Body.Bytes(), `{
+		"id": "srv-1",
+		"namespace": "default",
+		"name": "weather",
+		"displayName": "",
+		"description": "",
+		"labels": {},
+		"enabled": true,
+		"revision": 1,
+		"spec": {
+			"transport": "streamable_http",
+			"runtime": {"type": "remote", "remote": {"endpoint": "http://weather-mcp:8080/mcp"}},
+			"credentialId": null,
+			"timeouts": {"connectSeconds": 5, "listSeconds": 10, "callSeconds": 60},
+			"limits": {"maxInFlight": 16},
+			"desiredState": "running"
+		},
+		"status": {
+			"phase": "ready",
+			"message": "",
+			"observedRevision": 1,
+			"lastHealthAt": null,
+			"lastSuccessAt": null,
+			"consecutiveFailures": 0
+		},
+		"createdAt": "0001-01-01T00:00:00Z",
+		"updatedAt": "0001-01-01T00:00:00Z",
+		"links": {"self": "/api/v1/mcp-servers/srv-1"}
+	}`)
+	if len(refresher.gets) != 1 || refresher.gets[0] != "srv-1" {
+		t.Errorf("refresher calls = %v, want [srv-1]", refresher.gets)
+	}
+}
+
+func TestRefreshToolsDomainErrors(t *testing.T) {
+	tests := []struct {
+		name     string
+		err      error
+		wantCode int
+		wantBody string
+	}{
+		{"missing server", server.ErrNotFound, http.StatusNotFound, "not_found"},
+		{"not runnable", fmt.Errorf("%w: disabled", server.ErrNotRunnable), http.StatusConflict, "conflict"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			refresher := &fakeRefresher{err: tt.err}
+			h := newRefreshHandler(refresher)
+
+			rec := do(t, h, http.MethodPost, "/api/v1/mcp-servers/srv-1:refresh-tools", "")
+			if rec.Code != tt.wantCode {
+				t.Fatalf("status = %d, want %d; body: %s", rec.Code, tt.wantCode, rec.Body)
+			}
+			assertErrorCode(t, rec, tt.wantBody)
+		})
+	}
+}
+
+func TestActionRouteRejectsUnknownShapes(t *testing.T) {
+	tests := []struct{ name, path string }{
+		{"unknown action", "/api/v1/mcp-servers/srv-1:restart"},
+		{"missing action", "/api/v1/mcp-servers/srv-1:"},
+		{"no separator", "/api/v1/mcp-servers/srv-1"},
+		{"empty id", "/api/v1/mcp-servers/:refresh-tools"},
+		{"deeper path", "/api/v1/mcp-servers/a/b:refresh-tools"},
+		{"collection", "/api/v1/mcp-servers/"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			refresher := &fakeRefresher{srv: refreshableServer()}
+			h := newRefreshHandler(refresher)
+
+			rec := do(t, h, http.MethodPost, tt.path, "")
+			if rec.Code != http.StatusNotFound {
+				t.Fatalf("status = %d, want 404; body: %s", rec.Code, rec.Body)
+			}
+			assertErrorCode(t, rec, "not_found")
+			if len(refresher.gets) != 0 {
+				t.Errorf("refresher calls = %v, want none", refresher.gets)
+			}
+		})
+	}
+}
+
+func TestActionRouteAbsentWithoutRefresher(t *testing.T) {
+	handler := httpapi.NewHandler(httpapi.Options{
+		Registry: failingRegistry{err: errors.New("unused")},
+		Logger:   slog.New(slog.NewTextHandler(io.Discard, nil)),
+	})
+
+	// 未配置 Refresher 时不注册动作模式：该路径只匹配 GET /{id}，因此是 405 而非命中动作 handler。
+	rec := do(t, handler, http.MethodPost, "/api/v1/mcp-servers/srv-1:refresh-tools", "")
+	if rec.Code != http.StatusMethodNotAllowed {
+		t.Fatalf("status = %d, want 405 when no refresher is configured; body: %s", rec.Code, rec.Body)
 	}
 }

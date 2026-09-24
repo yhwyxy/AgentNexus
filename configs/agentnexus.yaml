@@ -5,3 +5,7 @@ server:
 
 database:
   path: "data/agentnexus.db"
+
+# 运行态收敛：启动重放之后按该间隔重试未收敛的 Server，0 表示关闭周期巡检。
+runtime:
+  reconcileInterval: 30s
