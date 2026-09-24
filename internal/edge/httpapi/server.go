@@ -6,8 +6,17 @@ import (
 	"net/http"
 )
 
-// NewHandler 装配全部 HTTP 路由。logger 为 nil 时使用 slog.Default()。
+// NewHandler 装配管理路由。logger 为 nil 时使用 slog.Default()。
 func NewHandler(registry ServerRegistry, logger *slog.Logger) http.Handler {
+	return newHandler(registry, nil, logger)
+}
+
+// NewHandlerWithMCP 在管理路由外装配 Streamable HTTP MCP 端点。
+func NewHandlerWithMCP(registry ServerRegistry, mcpHandler http.Handler, logger *slog.Logger) http.Handler {
+	return newHandler(registry, mcpHandler, logger)
+}
+
+func newHandler(registry ServerRegistry, mcpHandler http.Handler, logger *slog.Logger) http.Handler {
 	if logger == nil {
 		logger = slog.Default()
 	}
@@ -18,7 +27,9 @@ func NewHandler(registry ServerRegistry, logger *slog.Logger) http.Handler {
 	mux.HandleFunc("GET /health/ready", handleReady)
 	mux.HandleFunc("POST "+serverRoute, servers.register)
 	mux.HandleFunc("GET "+serverRoute+"/{id}", servers.get)
-
+	if mcpHandler != nil {
+		mux.Handle("/mcp", mcpHandler)
+	}
 	return mux
 }
 
