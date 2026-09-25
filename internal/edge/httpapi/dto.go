@@ -26,6 +26,29 @@ type registerRequest struct {
 	Limits       *limitDTO         `json:"limits"`
 }
 
+// updateRequest 对应详细设计 §13 的 PUT 全量替换语义。
+// 只有可变字段出现在这里：namespace/name/transport 不可变，enabled 与 desiredState
+// 各有专责动作端点；它们不在 DTO 上，而 decodeJSON 拒绝未知字段，因此显式传这些字段
+// 会得到 400 invalid_argument，而不是被静默忽略。
+// Revision 是乐观锁载体（必填且 > 0）；runtime 必填（形状校验与注册共用同一映射）。
+type updateRequest struct {
+	Revision     int64             `json:"revision"`
+	DisplayName  string            `json:"displayName"`
+	Description  string            `json:"description"`
+	Labels       map[string]string `json:"labels"`
+	Runtime      *runtimeDTO       `json:"runtime"`
+	CredentialID *string           `json:"credentialId"`
+	Timeouts     timeoutDTO        `json:"timeouts"`
+	Limits       limitDTO          `json:"limits"`
+}
+
+// listResponse 是 GET 集合端点的信封。Items 在空集合时必须是 [] 而不是 null：
+// 调用方（脚本、Dashboard）不该为"没有 Server"写第二套分支。
+type listResponse struct {
+	Items []serverResponse `json:"items"`
+	Count int              `json:"count"`
+}
+
 // runtimeDTO 是 RuntimeSpec tagged union 的线上表示；请求与响应共用，
 // 只序列化实际存在的变体。
 type runtimeDTO struct {
@@ -127,16 +150,27 @@ func (req registerRequest) toInput() server.RegisterInput {
 		CredentialID: req.CredentialID,
 	}
 	if req.Timeouts != nil {
-		in.Timeouts = server.TimeoutSpec{
-			Connect: seconds(req.Timeouts.ConnectSeconds),
-			List:    seconds(req.Timeouts.ListSeconds),
-			Call:    seconds(req.Timeouts.CallSeconds),
-		}
+		in.Timeouts = req.Timeouts.toSpec()
 	}
 	if req.Limits != nil {
-		in.Limits = server.LimitSpec{MaxInFlight: req.Limits.MaxInFlight}
+		in.Limits = req.Limits.toSpec()
 	}
 	return in
+}
+
+// toInput 把 PUT 请求体映射为领域可变字段集合。调用方必须先确认 Runtime 非 nil：
+// runtime 是必填字段，缺省不是"清空"而是非法请求（服务端在此不做静默回落）。
+// 零值的 timeouts/limits 原样传给 Service，由它在唯一一处 applyDefaults 填冻结默认值。
+func (req updateRequest) toInput() server.UpdateInput {
+	return server.UpdateInput{
+		DisplayName:  req.DisplayName,
+		Description:  req.Description,
+		Labels:       req.Labels,
+		Runtime:      req.Runtime.toSpec(),
+		CredentialID: req.CredentialID,
+		Timeouts:     req.Timeouts.toSpec(),
+		Limits:       req.Limits.toSpec(),
+	}
 }
 
 func (d runtimeDTO) toSpec() server.RuntimeSpec {
@@ -173,6 +207,21 @@ func (d runtimeDTO) toSpec() server.RuntimeSpec {
 		}
 	}
 	return spec
+}
+
+// toSpec 把整秒表示的超时转换为领域时长；零值保持零值，
+// 由 Service 统一回落到冻结默认值（注册与更新共用这一条路径）。
+func (d timeoutDTO) toSpec() server.TimeoutSpec {
+	return server.TimeoutSpec{
+		Connect: seconds(d.ConnectSeconds),
+		List:    seconds(d.ListSeconds),
+		Call:    seconds(d.CallSeconds),
+	}
+}
+
+// toSpec 把限流参数转换为领域表示；0 同样表示"使用默认值"。
+func (d limitDTO) toSpec() server.LimitSpec {
+	return server.LimitSpec{MaxInFlight: d.MaxInFlight}
 }
 
 func toServerResponse(s server.Server) serverResponse {

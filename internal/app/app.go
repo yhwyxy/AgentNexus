@@ -128,6 +128,8 @@ func Run(configPath string) error {
 		Registry:          registry,
 		Syncer:            syncer,
 		Auditor:           recorder,
+		Runtime:           runtimes,
+		Catalog:           catalog,
 		Lister:            servers,
 		ReconcileInterval: cfg.Runtime.ReconcileInterval,
 		Logger:            logger,
@@ -161,6 +163,7 @@ func Run(configPath string) error {
 		httpapi.NewHandler(httpapi.Options{
 			Registry:       lifecycle,
 			Refresher:      lifecycle,
+			Lifecycle:      lifecycle,
 			MCP:            mcpHandler,
 			Metrics:        meter,
 			Authenticator:  authorizer,

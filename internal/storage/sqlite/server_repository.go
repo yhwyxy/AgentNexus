@@ -124,7 +124,17 @@ func (r *ServerRepository) GetByName(ctx context.Context, namespace, name string
 }
 
 func (r *ServerRepository) ListEnabled(ctx context.Context) ([]server.Server, error) {
-	rows, err := r.db.QueryContext(ctx, `
+	return r.list(ctx, "a.enabled = 1")
+}
+
+func (r *ServerRepository) List(ctx context.Context) ([]server.Server, error) {
+	return r.list(ctx, "")
+}
+
+// list 是 List/ListEnabled 的公共实现：where 为空时不做过滤。
+// 排序在存储层固定，避免调用方各自排序出不同的列表口径。
+func (r *ServerRepository) list(ctx context.Context, where string) ([]server.Server, error) {
+	query := `
 		SELECT a.id, a.namespace, a.name, a.display_name, a.description,
 		       a.labels_json, a.enabled, a.revision, a.created_at, a.updated_at,
 		       m.transport, m.runtime_type, m.runtime_spec_json, m.credential_id,
@@ -135,10 +145,15 @@ func (r *ServerRepository) ListEnabled(ctx context.Context) ([]server.Server, er
 		FROM assets a
 		JOIN mcp_servers m ON m.asset_id = a.id
 		JOIN server_status st ON st.asset_id = a.id
-		WHERE a.enabled = 1 AND a.kind = 'MCPServer'
-		ORDER BY a.namespace, a.name`)
+		WHERE a.kind = 'MCPServer'`
+	if where != "" {
+		query += " AND " + where
+	}
+	query += " ORDER BY a.namespace, a.name"
+
+	rows, err := r.db.QueryContext(ctx, query)
 	if err != nil {
-		return nil, fmt.Errorf("list enabled servers: %w", err)
+		return nil, fmt.Errorf("list servers: %w", err)
 	}
 	defer rows.Close()
 
@@ -153,12 +168,27 @@ func (r *ServerRepository) ListEnabled(ctx context.Context) ([]server.Server, er
 	return out, rows.Err()
 }
 
-func (r *ServerRepository) UpdateSpec(
+// Update 以 expectedRevision 做乐观锁，覆盖 UpdateInput 的可变字段并递增 Revision。
+// transport 与 desired_state 不在写入列内：前者不可变，后者是运行意图（见 SetDesiredState）。
+func (r *ServerRepository) Update(
 	ctx context.Context,
 	id server.ID,
 	expectedRevision int64,
-	mutate func(*server.Spec) error,
+	in server.UpdateInput,
 ) (server.Server, error) {
+	labels := in.Labels
+	if labels == nil {
+		labels = map[string]string{}
+	}
+	labelsJSON, err := json.Marshal(labels)
+	if err != nil {
+		return server.Server{}, fmt.Errorf("marshal labels: %w", err)
+	}
+	specJSON, err := json.Marshal(in.Runtime)
+	if err != nil {
+		return server.Server{}, fmt.Errorf("marshal runtime spec: %w", err)
+	}
+
 	tx, err := r.db.BeginTx(ctx, nil)
 	if err != nil {
 		return server.Server{}, fmt.Errorf("begin tx: %w", err)
@@ -173,50 +203,40 @@ func (r *ServerRepository) UpdateSpec(
 	if err != nil {
 		return server.Server{}, err
 	}
-	// 预检查只为避免在明显过期时执行 mutate；真正的并发保护是
-	// 下面 UPDATE 的 WHERE revision = ?。
+	// 预检查只为提前失败；真正的并发保护是下面 UPDATE 的 WHERE revision = ?。
 	if current.Revision != expectedRevision {
 		return server.Server{}, server.ErrConflict
 	}
 
-	spec := current.Spec
-	if err := mutate(&spec); err != nil {
-		return server.Server{}, err
-	}
-
-	specJSON, err := json.Marshal(spec.Runtime)
-	if err != nil {
-		return server.Server{}, fmt.Errorf("marshal runtime spec: %w", err)
-	}
-
 	res, err := tx.ExecContext(ctx, `
 		UPDATE assets
-		SET revision = revision + 1, updated_at = ?
+		SET display_name = ?, description = ?, labels_json = ?,
+		    revision = revision + 1, updated_at = ?
 		WHERE id = ? AND kind = 'MCPServer' AND revision = ?`,
+		in.DisplayName, in.Description, string(labelsJSON),
 		formatTime(r.now()), string(id), expectedRevision,
 	)
 	if err != nil {
-		return server.Server{}, fmt.Errorf("update asset revision: %w", err)
+		return server.Server{}, fmt.Errorf("update asset: %w", err)
 	}
 	if n, err := res.RowsAffected(); err != nil {
-		return server.Server{}, fmt.Errorf("update asset revision: %w", err)
+		return server.Server{}, fmt.Errorf("update asset: %w", err)
 	} else if n == 0 {
 		return server.Server{}, server.ErrConflict
 	}
 
 	_, err = tx.ExecContext(ctx, `
 		UPDATE mcp_servers
-		SET transport = ?, runtime_type = ?, runtime_spec_json = ?, credential_id = ?,
+		SET runtime_type = ?, runtime_spec_json = ?, credential_id = ?,
 		    connect_timeout_ms = ?, list_timeout_ms = ?, call_timeout_ms = ?,
-		    max_in_flight = ?, desired_state = ?
+		    max_in_flight = ?
 		WHERE asset_id = ?`,
-		string(spec.Transport), string(spec.Runtime.Type), string(specJSON),
-		nullableString(spec.CredentialID),
-		spec.Timeouts.Connect.Milliseconds(),
-		spec.Timeouts.List.Milliseconds(),
-		spec.Timeouts.Call.Milliseconds(),
-		spec.Limits.MaxInFlight,
-		string(spec.DesiredState),
+		string(in.Runtime.Type), string(specJSON),
+		nullableString(in.CredentialID),
+		in.Timeouts.Connect.Milliseconds(),
+		in.Timeouts.List.Milliseconds(),
+		in.Timeouts.Call.Milliseconds(),
+		in.Limits.MaxInFlight,
 		string(id),
 	)
 	if err != nil {
@@ -254,7 +274,8 @@ func (r *ServerRepository) UpdateStatus(ctx context.Context, id server.ID, input
 	return requireAffected(res, server.ErrNotFound)
 }
 
-func (r *ServerRepository) SetEnabled(ctx context.Context, id server.ID, enabled bool) error {
+// SetEnabled 写运行意图 enabled；不递增 revision（启用状态不是配置版本）。
+func (r *ServerRepository) SetEnabled(ctx context.Context, id server.ID, enabled bool) (server.Server, error) {
 	res, err := r.db.ExecContext(ctx, `
 		UPDATE assets
 		SET enabled = ?, updated_at = ?
@@ -262,9 +283,56 @@ func (r *ServerRepository) SetEnabled(ctx context.Context, id server.ID, enabled
 		boolToInt(enabled), formatTime(r.now()), string(id),
 	)
 	if err != nil {
-		return fmt.Errorf("update asset enabled: %w", err)
+		return server.Server{}, fmt.Errorf("update asset enabled: %w", err)
 	}
-	return requireAffected(res, server.ErrNotFound)
+	if err := requireAffected(res, server.ErrNotFound); err != nil {
+		return server.Server{}, err
+	}
+	// 回读而不是拼装返回值：phase/observed_revision 等观测字段由运行态写入，
+	// 返回库里的真实形态才能与紧随其后的 GET 一致。
+	return r.GetByID(ctx, id)
+}
+
+// SetDesiredState 写期望运行态；同样不递增 revision。
+// assets.updated_at 与 SetEnabled 保持一致:两者都是调用方发起的资产变更,
+// 都应刷新"记录最后修改时间"(健康检查那类系统心跳才不该碰它)。
+func (r *ServerRepository) SetDesiredState(ctx context.Context, id server.ID, state server.DesiredState) (server.Server, error) {
+	tx, err := r.db.BeginTx(ctx, nil)
+	if err != nil {
+		return server.Server{}, fmt.Errorf("begin tx: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	res, err := tx.ExecContext(ctx, `
+		UPDATE assets
+		SET updated_at = ?
+		WHERE id = ? AND kind = 'MCPServer'`,
+		formatTime(r.now()), string(id),
+	)
+	if err != nil {
+		return server.Server{}, fmt.Errorf("update asset updated_at: %w", err)
+	}
+	if err := requireAffected(res, server.ErrNotFound); err != nil {
+		return server.Server{}, err
+	}
+
+	res, err = tx.ExecContext(ctx, `
+		UPDATE mcp_servers
+		SET desired_state = ?
+		WHERE asset_id = ?`,
+		string(state), string(id),
+	)
+	if err != nil {
+		return server.Server{}, fmt.Errorf("update desired state: %w", err)
+	}
+	if err := requireAffected(res, server.ErrNotFound); err != nil {
+		return server.Server{}, err
+	}
+
+	if err := tx.Commit(); err != nil {
+		return server.Server{}, fmt.Errorf("commit tx: %w", err)
+	}
+	return r.GetByID(ctx, id)
 }
 
 // rowQuerier 同时适配 *sql.DB 和 *sql.Tx，使单行查询可在事务内外复用。

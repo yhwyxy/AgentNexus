@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"sort"
 	"strings"
 	"sync"
 	"testing"
@@ -517,19 +518,37 @@ func (r *managerRepo) ListEnabled(context.Context) ([]server.Server, error) {
 	return servers, nil
 }
 
-func (r *managerRepo) UpdateSpec(_ context.Context, id server.ID, expectedRevision int64, mutate func(*server.Spec) error) (server.Server, error) {
+func (r *managerRepo) List(context.Context) ([]server.Server, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	out := make([]server.Server, 0, len(r.servers))
+	for _, srv := range r.servers {
+		out = append(out, srv)
+	}
+	// 与存储层一致：按 namespace、name 排序。
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].Namespace != out[j].Namespace {
+			return out[i].Namespace < out[j].Namespace
+		}
+		return out[i].Name < out[j].Name
+	})
+	return out, nil
+}
+
+func (r *managerRepo) Update(_ context.Context, id server.ID, expectedRevision int64, in server.UpdateInput) (server.Server, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	srv, ok := r.servers[id]
-	if !ok {
+	if !ok || srv.Revision != expectedRevision {
 		return server.Server{}, server.ErrConflict
 	}
-	if srv.Revision != expectedRevision {
-		return server.Server{}, server.ErrConflict
-	}
-	if err := mutate(&srv.Spec); err != nil {
-		return server.Server{}, err
-	}
+	srv.DisplayName = in.DisplayName
+	srv.Description = in.Description
+	srv.Labels = in.Labels
+	srv.Spec.Runtime = in.Runtime
+	srv.Spec.CredentialID = in.CredentialID
+	srv.Spec.Timeouts = in.Timeouts
+	srv.Spec.Limits = in.Limits
 	srv.Revision++
 	r.servers[id] = srv
 	return srv, nil
@@ -558,16 +577,28 @@ func (r *managerRepo) UpdateStatus(_ context.Context, id server.ID, input server
 	return nil
 }
 
-func (r *managerRepo) SetEnabled(_ context.Context, id server.ID, enabled bool) error {
+func (r *managerRepo) SetEnabled(_ context.Context, id server.ID, enabled bool) (server.Server, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	srv, ok := r.servers[id]
 	if !ok {
-		return server.ErrNotFound
+		return server.Server{}, server.ErrNotFound
 	}
 	srv.Enabled = enabled
 	r.servers[id] = srv
-	return nil
+	return srv, nil
+}
+
+func (r *managerRepo) SetDesiredState(_ context.Context, id server.ID, state server.DesiredState) (server.Server, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	srv, ok := r.servers[id]
+	if !ok {
+		return server.Server{}, server.ErrNotFound
+	}
+	srv.Spec.DesiredState = state
+	r.servers[id] = srv
+	return srv, nil
 }
 
 func (r *managerRepo) update(id server.ID, mutate func(*server.Server)) {

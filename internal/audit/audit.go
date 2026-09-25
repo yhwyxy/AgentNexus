@@ -40,6 +40,18 @@ type EventType string
 const (
 	// EventServerRegistered 管理 API 注册成功（asset 已持久化）。
 	EventServerRegistered EventType = "server.registered"
+	// EventServerUpdated 管理 API 全量更新配置成功（revision 已递增）。
+	EventServerUpdated EventType = "server.updated"
+	// EventServerEnabled 管理 API 启用 Server（运行意图，不改 revision）。
+	EventServerEnabled EventType = "server.enabled"
+	// EventServerDisabled 管理 API 停用 Server，且活动实例已同步停止。
+	EventServerDisabled EventType = "server.disabled"
+	// EventServerStarted 管理 API 请求启动；实例启动在队列中异步进行。
+	EventServerStarted EventType = "server.started"
+	// EventServerStopped 管理 API 停止 Server，且活动实例已同步停止。
+	EventServerStopped EventType = "server.stopped"
+	// EventServerRestarted 管理 API 重启 Server：旧实例已停止，新实例待队列重建。
+	EventServerRestarted EventType = "server.restarted"
 	// EventServerRefreshRequested 手工 refresh-tools 被受理（异步同步尚未开始）。
 	EventServerRefreshRequested EventType = "server.refresh_requested"
 	// EventToolSnapshotPublished Tool 快照原子替换成功（目录已可路由新工具）。
@@ -60,6 +72,12 @@ const (
 
 var eventTypes = map[EventType]struct{}{
 	EventServerRegistered:       {},
+	EventServerUpdated:          {},
+	EventServerEnabled:          {},
+	EventServerDisabled:         {},
+	EventServerStarted:          {},
+	EventServerStopped:          {},
+	EventServerRestarted:        {},
 	EventServerRefreshRequested: {},
 	EventToolSnapshotPublished:  {},
 	EventToolSyncFailed:         {},

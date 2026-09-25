@@ -20,6 +20,23 @@ import (
 type ServerRegistry interface {
 	Register(ctx context.Context, in server.RegisterInput) (server.Server, error)
 	Get(ctx context.Context, id server.ID) (server.Server, error)
+	List(ctx context.Context) ([]server.Server, error)
+	Update(ctx context.Context, id server.ID, expectedRevision int64, in server.UpdateInput) (server.Server, error)
+	SetEnabled(ctx context.Context, id server.ID, enabled bool) (server.Server, error)
+	SetDesiredState(ctx context.Context, id server.ID, state server.DesiredState) (server.Server, error)
+}
+
+// RuntimeConverger 是 Lifecycle 对运行态收敛的最小依赖（*runtime.ProviderManager 实现）。
+// Reconcile 按库里的当前配置收敛实例：非运行态的 Server 会停掉已加载实例并写入 phase=stopped。
+// Stop 只做同步回收，用于 Restart 重建前的拆除。
+type RuntimeConverger interface {
+	Reconcile(ctx context.Context, id server.ID) error
+	Stop(ctx context.Context, id server.ID) error
+}
+
+// CatalogInvalidator 是 Lifecycle 对 Tool 目录缓存的最小依赖（*tool.CatalogCache 实现）。
+type CatalogInvalidator interface {
+	Invalidate()
 }
 
 // AuditRecorder 是 Lifecycle 对审计写入的最小依赖（消费者定义接口）。
@@ -34,10 +51,12 @@ type ToolSynchronizer interface {
 
 // LifecycleOptions 是 Lifecycle 的装配参数。
 type LifecycleOptions struct {
-	// Registry、Syncer 与 Auditor 必填。
+	// Registry、Syncer、Auditor、Runtime 与 Catalog 必填。
 	Registry ServerRegistry
 	Syncer   ToolSynchronizer
 	Auditor  AuditRecorder
+	Runtime  RuntimeConverger
+	Catalog  CatalogInvalidator
 	// Lister 为 nil 时关闭启动重放与周期巡检，只保留注册触发。
 	Lister ServerLister
 	// ReconcileInterval <= 0 时只做启动重放，不做周期巡检。
@@ -52,6 +71,8 @@ type Lifecycle struct {
 	registry ServerRegistry
 	syncer   ToolSynchronizer
 	auditor  AuditRecorder
+	runtimes RuntimeConverger
+	catalog  CatalogInvalidator
 	logger   *slog.Logger
 
 	lister            ServerLister
@@ -81,6 +102,12 @@ func NewLifecycle(opts LifecycleOptions) (*Lifecycle, error) {
 	if opts.Auditor == nil {
 		return nil, errors.New("new lifecycle: audit recorder is required")
 	}
+	if opts.Runtime == nil {
+		return nil, errors.New("new lifecycle: runtime converger is required")
+	}
+	if opts.Catalog == nil {
+		return nil, errors.New("new lifecycle: catalog invalidator is required")
+	}
 	logger := opts.Logger
 	if logger == nil {
 		logger = slog.Default()
@@ -91,6 +118,8 @@ func NewLifecycle(opts LifecycleOptions) (*Lifecycle, error) {
 		registry:          opts.Registry,
 		syncer:            opts.Syncer,
 		auditor:           opts.Auditor,
+		runtimes:          opts.Runtime,
+		catalog:           opts.Catalog,
 		logger:            logger,
 		lister:            opts.Lister,
 		reconcileInterval: opts.ReconcileInterval,
@@ -121,6 +150,100 @@ func (l *Lifecycle) Register(ctx context.Context, in server.RegisterInput) (serv
 
 // Get 直接委托注册服务。
 func (l *Lifecycle) Get(ctx context.Context, id server.ID) (server.Server, error) {
+	return l.registry.Get(ctx, id)
+}
+
+// List 直接委托注册服务；排序由仓储保证。
+func (l *Lifecycle) List(ctx context.Context) ([]server.Server, error) {
+	return l.registry.List(ctx)
+}
+
+// Update 全量替换 Server 的可变配置（revision 乐观锁）。成功后失效目录缓存并把运行态收敛排入队列：
+// 配置变了，实例与工具集都得按新配置重建。
+// 写库失败时既不失效缓存也不触发收敛——失败的写不产生任何可见性变化。
+func (l *Lifecycle) Update(ctx context.Context, id server.ID, expectedRevision int64, in server.UpdateInput) (server.Server, error) {
+	srv, err := l.registry.Update(ctx, id, expectedRevision, in)
+	if err != nil {
+		return server.Server{}, err
+	}
+	l.invalidateCatalog()
+	l.Trigger(srv.ID)
+	return srv, nil
+}
+
+// SetEnabled 切换启用位（运行意图，不递增 Revision）。启用后只有期望运行态的 Server 才排队收敛；
+// 停用走同步回收，返回的快照必须带上收敛后的 phase（stopped），否则调用方会以为实例还在跑。
+// 幂等：已是目标值时注册服务不写库，但回收/收敛仍会执行一次，让 degraded 的 Server 有自愈机会。
+func (l *Lifecycle) SetEnabled(ctx context.Context, id server.ID, enabled bool) (server.Server, error) {
+	srv, err := l.registry.SetEnabled(ctx, id, enabled)
+	if err != nil {
+		return server.Server{}, err
+	}
+	l.invalidateCatalog()
+	if enabled {
+		if srv.Runnable() {
+			l.Trigger(srv.ID)
+		}
+		return srv, nil
+	}
+	if err := l.runtimes.Reconcile(ctx, id); err != nil {
+		return server.Server{}, err
+	}
+	return l.registry.Get(ctx, id)
+}
+
+// Start 把期望运行态置为 running 并排队收敛。disabled 的 Server 直接拒绝且不写库、不触发：
+// 启用是 :enable 的职责，start 不该顺手改 enabled。
+// 已是 running 时写库幂等，但仍触发一次收敛，让 degraded 的 Server 有自愈机会。
+func (l *Lifecycle) Start(ctx context.Context, id server.ID) (server.Server, error) {
+	srv, err := l.registry.Get(ctx, id)
+	if err != nil {
+		return server.Server{}, err
+	}
+	if !srv.Enabled {
+		return server.Server{}, fmt.Errorf("%w: server is disabled", server.ErrNotRunnable)
+	}
+	updated, err := l.registry.SetDesiredState(ctx, id, server.DesiredRunning)
+	if err != nil {
+		return server.Server{}, err
+	}
+	l.invalidateCatalog()
+	l.Trigger(id)
+	return updated, nil
+}
+
+// Stop 把期望运行态置为 stopped，并同步回收实例：响应里的 phase 必须已经是 stopped，
+// 排队回收会让调用方在停止失败时误以为已经停止。
+func (l *Lifecycle) Stop(ctx context.Context, id server.ID) (server.Server, error) {
+	if _, err := l.registry.Get(ctx, id); err != nil {
+		return server.Server{}, err
+	}
+	if _, err := l.registry.SetDesiredState(ctx, id, server.DesiredStopped); err != nil {
+		return server.Server{}, err
+	}
+	l.invalidateCatalog()
+	if err := l.runtimes.Reconcile(ctx, id); err != nil {
+		return server.Server{}, err
+	}
+	return l.registry.Get(ctx, id)
+}
+
+// Restart 换一个实例而不改配置：同步停掉旧实例，再排队让 worker 重建并复核 Tool 快照。
+// 不写库、不递增 Revision，因此巡检不会把 observedRevision != revision 当成漂移。
+// 仅对 Runnable 的 Server 有意义，否则返回 ErrNotRunnable（由 HTTP 层映射为 409）。
+func (l *Lifecycle) Restart(ctx context.Context, id server.ID) (server.Server, error) {
+	srv, err := l.registry.Get(ctx, id)
+	if err != nil {
+		return server.Server{}, err
+	}
+	if !srv.Runnable() {
+		return server.Server{}, fmt.Errorf("%w: server is not runnable", server.ErrNotRunnable)
+	}
+	if err := l.runtimes.Stop(ctx, id); err != nil {
+		return server.Server{}, err
+	}
+	l.invalidateCatalog()
+	l.Trigger(id)
 	return l.registry.Get(ctx, id)
 }
 
@@ -277,6 +400,15 @@ func (l *Lifecycle) assetName(ctx context.Context, id server.ID) string {
 	}
 
 	return srv.Name
+}
+
+// invalidateCatalog 让进程内目录缓存失效，下一次读取会从仓储重建。
+// 可见性变化与队列收敛是两个独立后果：写库成功后缓存必须失效，即使后续动作失败。
+func (l *Lifecycle) invalidateCatalog() {
+	if l.catalog == nil {
+		return
+	}
+	l.catalog.Invalidate()
 }
 
 func (l *Lifecycle) record(ctx context.Context, in audit.Input) {

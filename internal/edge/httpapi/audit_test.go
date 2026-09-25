@@ -48,6 +48,7 @@ type auditFixture struct {
 	handler   http.Handler
 	repo      *memoryAuditRepo
 	refresher *fakeRefresher
+	lifecycle *fakeLifecycle
 	logs      *bytes.Buffer
 }
 
@@ -59,17 +60,20 @@ func newAuditFixture(t *testing.T) *auditFixture {
 	logger := slog.New(slog.NewJSONHandler(logs, nil))
 	registry := newTestRegistry(t)
 	refresher := &fakeRefresher{srv: refreshableServer()}
+	lifecycle := &fakeLifecycle{srv: refreshableServer()}
 
 	return &auditFixture{
 		handler: httpapi.NewHandler(httpapi.Options{
 			Registry:      registry,
 			Refresher:     refresher,
+			Lifecycle:     lifecycle,
 			Authenticator: testAuthorizer(t),
 			Auditor:       audit.NewRecorder(repo),
 			Logger:        logger,
 		}),
 		repo:      repo,
 		refresher: refresher,
+		lifecycle: lifecycle,
 		logs:      logs,
 	}
 }
@@ -173,6 +177,8 @@ func TestFailedRequestsEmitNoAuditEvents(t *testing.T) {
 		{"unknown action", http.MethodPost, "/api/v1/mcp-servers/srv-1:nope", "", nil},
 		{"unauthenticated", http.MethodPost, "/api/v1/mcp-servers", "{}", map[string]string{"Authorization": "Bearer wrong"}},
 		{"agent refreshes", http.MethodPost, "/api/v1/mcp-servers/srv-1:refresh-tools", "", map[string]string{"Authorization": "Bearer " + testAgentSecret}},
+		{"update of an unknown server", http.MethodPut, "/api/v1/mcp-servers/ghost", updateBody(1, "Weather", nil), nil},
+		{"action with a body", http.MethodPost, "/api/v1/mcp-servers/srv-1:stop", "{}", nil},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -343,5 +349,96 @@ func TestRequestLogMiddlewareKeepsStreaming(t *testing.T) {
 	}
 	if !recorder.Flushed {
 		t.Fatal("underlying ResponseWriter was not flushed")
+	}
+}
+
+// PUT 成功必须留痕，且 Detail 只放 revision 水位——runtime/endpoint 可能含敏感上下文。
+func TestUpdateEmitsAuditEvent(t *testing.T) {
+	fixture := newAuditFixture(t)
+
+	if rec := do(t, fixture.handler, http.MethodPost, "/api/v1/mcp-servers", minimalWeather); rec.Code != http.StatusAccepted {
+		t.Fatalf("register status = %d, want 202; body: %s", rec.Code, rec.Body)
+	}
+
+	rec := do(t, fixture.handler, http.MethodPut, "/api/v1/mcp-servers/srv-1",
+		updateBody(1, "Weather v2", map[string]string{"team": "platform"}))
+	if rec.Code != http.StatusAccepted {
+		t.Fatalf("PUT status = %d, want 202; body: %s", rec.Code, rec.Body)
+	}
+
+	events := fixture.repo.recorded()
+	if len(events) != 2 {
+		t.Fatalf("audit events = %d, want 2 (registered + updated): %#v", len(events), events)
+	}
+	event := events[1]
+	if event.Type != audit.EventServerUpdated || event.Outcome != audit.OutcomeSuccess {
+		t.Fatalf("event = %q/%q, want server.updated/success", event.Type, event.Outcome)
+	}
+	if event.AssetID != "srv-1" || event.AssetName != "weather" {
+		t.Errorf("asset = %q/%q, want srv-1/weather", event.AssetID, event.AssetName)
+	}
+
+	detail := string(event.Detail)
+	for _, forbidden := range []string{"weather-mcp", "endpoint", "platform"} {
+		if strings.Contains(detail, forbidden) {
+			t.Errorf("audit detail leaked %q: %s", forbidden, detail)
+		}
+	}
+	var fields map[string]any
+	if err := json.Unmarshal(event.Detail, &fields); err != nil {
+		t.Fatalf("detail is not a JSON object: %v", err)
+	}
+	if fields["from_revision"] != float64(1) || fields["to_revision"] != float64(2) {
+		t.Errorf("detail = %v, want from_revision 1 / to_revision 2", fields)
+	}
+}
+
+// 五个生命周期动作各写一类事件；Detail 形状一致（revision + phase），动作到方法的映射
+// 也要在事件里可见（否则审计无法区分 enable 与 start）。
+func TestLifecycleActionsEmitAuditEvents(t *testing.T) {
+	tests := []struct {
+		action   string
+		wantType audit.EventType
+		wantCall string
+	}{
+		{"enable", audit.EventServerEnabled, "set-enabled:srv-1:true"},
+		{"disable", audit.EventServerDisabled, "set-enabled:srv-1:false"},
+		{"start", audit.EventServerStarted, "start:srv-1"},
+		{"stop", audit.EventServerStopped, "stop:srv-1"},
+		{"restart", audit.EventServerRestarted, "restart:srv-1"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.action, func(t *testing.T) {
+			fixture := newAuditFixture(t)
+
+			rec := do(t, fixture.handler, http.MethodPost, "/api/v1/mcp-servers/srv-1:"+tt.action, "")
+			if rec.Code >= 400 {
+				t.Fatalf("status = %d, want success; body: %s", rec.Code, rec.Body)
+			}
+
+			events := fixture.repo.recorded()
+			if len(events) != 1 {
+				t.Fatalf("audit events = %d, want 1: %#v", len(events), events)
+			}
+			event := events[0]
+			if event.Type != tt.wantType || event.Outcome != audit.OutcomeSuccess {
+				t.Fatalf("event = %q/%q, want %q/success", event.Type, event.Outcome, tt.wantType)
+			}
+			if event.AssetID != "srv-1" || event.AssetName != "weather" {
+				t.Errorf("asset = %q/%q, want srv-1/weather", event.AssetID, event.AssetName)
+			}
+
+			var fields map[string]any
+			if err := json.Unmarshal(event.Detail, &fields); err != nil {
+				t.Fatalf("detail is not a JSON object: %v", err)
+			}
+			if fields["revision"] != float64(1) || fields["phase"] != "ready" {
+				t.Errorf("detail = %v, want revision 1 / phase ready", fields)
+			}
+			if len(fixture.lifecycle.calls) != 1 || fixture.lifecycle.calls[0] != tt.wantCall {
+				t.Errorf("lifecycle calls = %v, want [%s]", fixture.lifecycle.calls, tt.wantCall)
+			}
+		})
 	}
 }
