@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"sort"
 	"sync"
 
 	"github.com/yhwyxy/AgentNexus/internal/server"
@@ -15,6 +16,7 @@ var (
 	ErrDesiredStateStopped = errors.New("runtime server is not desired running")
 	ErrProviderNotFound    = errors.New("runtime provider not found")
 	ErrInvalidInstance     = errors.New("runtime provider returned an invalid instance")
+	ErrManagerClosed       = errors.New("runtime manager is closed")
 )
 
 const runtimePhaseRunning = "running"
@@ -32,6 +34,7 @@ type ProviderManager struct {
 
 	mu     sync.Mutex
 	active map[server.ID]managedInstance
+	closed bool
 }
 
 var _ Manager = (*ProviderManager)(nil)
@@ -69,6 +72,9 @@ func NewManager(servers server.Repository, providers ...Provider) (*ProviderMana
 func (m *ProviderManager) EnsureReady(ctx context.Context, requested server.Server) (Instance, error) {
 	if requested.ID == "" {
 		return Instance{}, errors.New("ensure runtime: server ID is required")
+	}
+	if m.isClosed() {
+		return Instance{}, ErrManagerClosed
 	}
 	unlock := m.locks.lock(requested.ID)
 	defer unlock()
@@ -139,6 +145,9 @@ func (m *ProviderManager) Stop(ctx context.Context, id server.ID) error {
 	if id == "" {
 		return errors.New("stop runtime: server ID is required")
 	}
+	if m.isClosed() {
+		return ErrManagerClosed
+	}
 	unlock := m.locks.lock(id)
 	defer unlock()
 
@@ -172,6 +181,9 @@ func (m *ProviderManager) Reconcile(ctx context.Context, id server.ID) error {
 	if id == "" {
 		return errors.New("reconcile runtime: server ID is required")
 	}
+	if m.isClosed() {
+		return ErrManagerClosed
+	}
 	unlock := m.locks.lock(id)
 	defer unlock()
 
@@ -184,6 +196,79 @@ func (m *ProviderManager) Reconcile(ctx context.Context, id server.ID) error {
 		return err
 	}
 	return m.stopLoaded(ctx, srv)
+}
+
+// Close 停止全部活动实例并调用实现了 Releaser 的 Provider 做最终回收。
+// 关闭后 EnsureReady/Stop/Reconcile 一律返回 ErrManagerClosed:应用退出的顺序是
+// 先停 HTTP 与生命周期队列,再 Close 本管理器,最后关闭 MCP session。
+func (m *ProviderManager) Close(ctx context.Context) error {
+	m.mu.Lock()
+	if m.closed {
+		m.mu.Unlock()
+		return nil
+	}
+	m.closed = true
+	m.mu.Unlock()
+
+	var errs []error
+	for {
+		pending := m.drainActive()
+		if len(pending) == 0 {
+			break
+		}
+		ids := make([]server.ID, 0, len(pending))
+		for id := range pending {
+			ids = append(ids, id)
+		}
+		sort.Slice(ids, func(i, j int) bool { return ids[i] < ids[j] })
+		for _, id := range ids {
+			managed := pending[id]
+			unlock := m.locks.lock(id)
+			if err := managed.provider.Stop(ctx, managed.instance); err != nil {
+				errs = append(errs, fmt.Errorf("stop runtime instance for server %q: %w", id, err))
+			}
+			unlock()
+		}
+	}
+	for _, provider := range m.sortedProviders() {
+		releaser, ok := provider.(Releaser)
+		if !ok {
+			continue
+		}
+		if err := releaser.Close(ctx); err != nil {
+			errs = append(errs, fmt.Errorf("close runtime provider %q: %w", provider.Type(), err))
+		}
+	}
+	return errors.Join(errs...)
+}
+
+func (m *ProviderManager) isClosed() bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.closed
+}
+
+// drainActive 取走当前全部活动实例。Close 与并发的 Ensure 可能交错,
+// 因此循环取用直到为空,而不是只取一次快照。
+func (m *ProviderManager) drainActive() map[server.ID]managedInstance {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	pending := m.active
+	m.active = make(map[server.ID]managedInstance)
+	return pending
+}
+
+func (m *ProviderManager) sortedProviders() []Provider {
+	types := make([]server.RuntimeType, 0, len(m.providers))
+	for runtimeType := range m.providers {
+		types = append(types, runtimeType)
+	}
+	sort.Slice(types, func(i, j int) bool { return types[i] < types[j] })
+	providers := make([]Provider, 0, len(types))
+	for _, runtimeType := range types {
+		providers = append(providers, m.providers[runtimeType])
+	}
+	return providers
 }
 
 // persistEnsured 记录运行态观测结果（ObservedRevision/LastSuccessAt）。

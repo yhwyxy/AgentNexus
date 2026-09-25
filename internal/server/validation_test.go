@@ -105,3 +105,73 @@ func TestServerValidate(t *testing.T) {
 		})
 	}
 }
+
+func validProcessServer() Server {
+	srv := validRemoteServer()
+	srv.Spec.Transport = TransportStdio
+	srv.Spec.Runtime = RuntimeSpec{
+		Type:    RuntimeProcess,
+		Process: &ProcessSpec{Command: "/usr/local/bin/demo-mcp"},
+	}
+	return srv
+}
+
+func TestProcessRuntimeValidate(t *testing.T) {
+	tests := []struct {
+		name    string
+		mutate  func(*Server)
+		wantErr bool
+	}{
+		{
+			name: "absolute command with env and working dir",
+			mutate: func(s *Server) {
+				s.Spec.Runtime.Process.Env = map[string]string{"DEMO_TOKEN_FILE": "/run/secrets/demo"}
+				s.Spec.Runtime.Process.WorkingDir = "/srv/demo"
+			},
+		},
+		{
+			name: "relative command",
+			mutate: func(s *Server) {
+				s.Spec.Runtime.Process.Command = "demo-mcp"
+			},
+			wantErr: true,
+		},
+		{
+			name: "relative working dir",
+			mutate: func(s *Server) {
+				s.Spec.Runtime.Process.WorkingDir = "srv/demo"
+			},
+			wantErr: true,
+		},
+		{
+			name: "invalid env key",
+			mutate: func(s *Server) {
+				s.Spec.Runtime.Process.Env = map[string]string{"DEMO-TOKEN": "value"}
+			},
+			wantErr: true,
+		},
+		{
+			name: "empty env key",
+			mutate: func(s *Server) {
+				s.Spec.Runtime.Process.Env = map[string]string{"": "value"}
+			},
+			wantErr: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			srv := validProcessServer()
+			if tt.mutate != nil {
+				tt.mutate(&srv)
+			}
+			err := srv.Validate()
+			if tt.wantErr && err == nil {
+				t.Fatal("Validate() error = nil, want error")
+			}
+			if !tt.wantErr && err != nil {
+				t.Fatalf("Validate() unexpected error: %v", err)
+			}
+		})
+	}
+}

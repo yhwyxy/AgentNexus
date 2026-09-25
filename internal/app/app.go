@@ -21,6 +21,7 @@ import (
 	"github.com/yhwyxy/AgentNexus/internal/mcpclient"
 	"github.com/yhwyxy/AgentNexus/internal/observability"
 	"github.com/yhwyxy/AgentNexus/internal/runtime"
+	"github.com/yhwyxy/AgentNexus/internal/runtime/process"
 	"github.com/yhwyxy/AgentNexus/internal/runtime/remote"
 	"github.com/yhwyxy/AgentNexus/internal/server"
 	"github.com/yhwyxy/AgentNexus/internal/storage/sqlite"
@@ -56,10 +57,19 @@ func Run(configPath string) error {
 	catalog := tool.NewCatalog(toolRepo)
 	clients := mcpclient.NewManager(mcpadapter.NewConnector())
 	defer clients.Close(context.Background())
-	runtimes, err := runtime.NewManager(servers, remote.NewProvider())
+	runtimes, err := runtime.NewManager(servers, remote.NewProvider(), process.NewProvider(ctx))
 	if err != nil {
 		return fmt.Errorf("create runtime manager: %w", err)
 	}
+	// 子进程由 ProviderManager 持有:关闭顺序是先停生命周期队列,再逐个终止子进程,
+	// 最后关闭 MCP session。defer 是后进先出,因此这里声明在 lifecycle 之前。
+	defer func() {
+		closeCtx, cancel := context.WithTimeout(context.Background(), cfg.Server.ShutdownTimeout)
+		defer cancel()
+		if err := runtimes.Close(closeCtx); err != nil {
+			logger.Warn("runtime providers did not stop cleanly", "error", err)
+		}
+	}()
 	syncer := tool.NewSyncService(servers, runtimes, clients, toolRepo, catalog)
 	// 运行态协调在后台完成：注册触发，加上启动重放与按 reconcileInterval 的周期巡检
 	// （重启后实例缓存为空，DB 里的 ready 不代表运行态存在，必须重放）。

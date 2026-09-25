@@ -8,7 +8,10 @@ import (
 	"time"
 )
 
-var namePattern = regexp.MustCompile(`^[a-z][a-z0-9-]{0,62}$`)
+var (
+	namePattern    = regexp.MustCompile(`^[a-z][a-z0-9-]{0,62}$`)
+	envNamePattern = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*$`)
+)
 
 func (s Server) Validate() error {
 	if !namePattern.MatchString(s.Namespace) {
@@ -129,6 +132,14 @@ func validateRemote(spec RemoteSpec) error {
 func validateProcess(spec ProcessSpec) error {
 	if !filepath.IsAbs(spec.Command) {
 		return fmt.Errorf("process command must be an absolute path")
+	}
+	if spec.WorkingDir != "" && !filepath.IsAbs(spec.WorkingDir) {
+		return fmt.Errorf("process working directory must be an absolute path")
+	}
+	for key := range spec.Env {
+		if !envNamePattern.MatchString(key) {
+			return fmt.Errorf("process env key %q is not a valid environment variable name", key)
+		}
 	}
 	return nil
 }
