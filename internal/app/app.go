@@ -21,6 +21,7 @@ import (
 	"github.com/yhwyxy/AgentNexus/internal/mcpadapter"
 	mcpserver "github.com/yhwyxy/AgentNexus/internal/mcpadapter/server"
 	"github.com/yhwyxy/AgentNexus/internal/mcpclient"
+	"github.com/yhwyxy/AgentNexus/internal/metrics"
 	"github.com/yhwyxy/AgentNexus/internal/observability"
 	"github.com/yhwyxy/AgentNexus/internal/runtime"
 	"github.com/yhwyxy/AgentNexus/internal/runtime/process"
@@ -70,6 +71,10 @@ func Run(configPath string) error {
 	// 共用同一个 Recorder,写入失败只记日志,绝不改变业务结果。
 	recorder := audit.NewRecorder(sqlite.NewAuditRepository(db))
 	observer := observability.NewAuditObserver(recorder, logger)
+	// metrics 与审计并列消费同一批领域事实,因此两个 seam 都扇出到它们。
+	// 健康 gauge 在抓取时读 ListEnabled,因此不需要额外的推送式更新点。
+	meter := metrics.New(servers, logger)
+	runtimeMetrics := metrics.NewObserver(meter)
 	toolRepo := sqlite.NewToolRepository(db)
 	catalog := tool.NewCatalog(toolRepo)
 	clients := mcpclient.NewManager(mcpadapter.NewConnector())
@@ -78,7 +83,7 @@ func Run(configPath string) error {
 	if err != nil {
 		return fmt.Errorf("create runtime manager: %w", err)
 	}
-	runtimes.WithObserver(observer)
+	runtimes.WithObserver(observability.MultiRuntimeObserver{observer, runtimeMetrics})
 	// 子进程由 ProviderManager 持有:关闭顺序是先停生命周期队列,再逐个终止子进程,
 	// 最后关闭 MCP session。defer 是后进先出,因此这里声明在 lifecycle 之前。
 	defer func() {
@@ -114,7 +119,7 @@ func Run(configPath string) error {
 	if err != nil {
 		return fmt.Errorf("create tool caller: %w", err)
 	}
-	caller.WithObserver(observer)
+	caller.WithObserver(observability.MultiCallObserver{observer, runtimeMetrics})
 	virtual, err := gateway.NewVirtualServer(catalog, caller)
 	if err != nil {
 		return fmt.Errorf("create virtual MCP server: %w", err)
@@ -127,12 +132,14 @@ func Run(configPath string) error {
 	httpServer := httpapi.NewServer(
 		cfg.Server.HTTPAddress,
 		httpapi.NewHandler(httpapi.Options{
-			Registry:      lifecycle,
-			Refresher:     lifecycle,
-			MCP:           mcpHandler,
-			Authenticator: authorizer,
-			Auditor:       recorder,
-			Logger:        logger,
+			Registry:       lifecycle,
+			Refresher:      lifecycle,
+			MCP:            mcpHandler,
+			Metrics:        meter,
+			Authenticator:  authorizer,
+			Auditor:        recorder,
+			RequestMetrics: meter,
+			Logger:         logger,
 		}),
 	)
 	serverErr := make(chan error, 1)

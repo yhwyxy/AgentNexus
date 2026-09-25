@@ -64,9 +64,24 @@ func setRecordErrorCode(ctx context.Context, code string) {
 	}
 }
 
+// requestLogOptions 是日志与指标采集的装配参数。
+type requestLogOptions struct {
+	// mux 用于取回本次请求命中的注册 pattern；nil 时 route 记为 unmatched。
+	mux      *http.ServeMux
+	patterns routePatterns
+	// metrics 为 nil 时不采集请求指标。
+	metrics RequestMetrics
+	logger  *slog.Logger
+}
+
 // withRequestLog 是最外层中间件：认证失败（401/403）的请求也要有 request_id、
 // status 与 error_code，因此它必须包在 withAuth 之外。
-func withRequestLog(next http.Handler, logger *slog.Logger) http.Handler {
+func withRequestLog(next http.Handler, opts requestLogOptions) http.Handler {
+	logger := opts.logger
+	if logger == nil {
+		logger = slog.Default()
+	}
+
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		requestID := r.Header.Get(requestIDHeader)
 		if !validRequestID(requestID) {
@@ -79,14 +94,22 @@ func withRequestLog(next http.Handler, logger *slog.Logger) http.Handler {
 		ctx := observability.WithRequestID(r.Context(), requestID)
 		ctx = context.WithValue(ctx, requestRecordKey{}, record)
 
+		// route 在进入 handler 前解析：它就是 mux 的注册 pattern（有界取值）。
+		route := opts.patterns.label(opts.mux, r)
+
 		status := &statusWriter{ResponseWriter: w}
 		started := time.Now()
 		next.ServeHTTP(status, r.WithContext(ctx))
 		duration := time.Since(started)
 
+		if opts.metrics != nil {
+			observeRequest(opts.metrics, logger, r.Method, route, status.code(), duration, record.errorCode)
+		}
+
 		logger.Info("request completed",
 			"method", r.Method,
 			"path", r.URL.Path,
+			"route", route,
 			"status", status.code(),
 			"duration_ms", duration.Milliseconds(),
 			"bytes", status.written,
