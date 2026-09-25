@@ -37,6 +37,19 @@ curl -s -X POST localhost:8080/api/v1/mcp-servers/<id>:refresh-tools   # 202; 40
 # the startup replay and the periodic sweep (runtime.reconcileInterval) drive the same convergence loop
 ```
 
+Authentication is required for everything except the two probes, so real requests need one of the configured keys:
+
+```bash
+export AGENTNEXUS_ADMIN_KEY=... AGENTNEXUS_AGENT_KEY=...     # keyEnv: unset or empty is fatal at startup
+curl -si -X POST localhost:8080/api/v1/mcp-servers -H "Authorization: Bearer $AGENTNEXUS_ADMIN_KEY" \
+  -H "X-Request-Id: smoke-1" -d '{...}'                      # 202; response echoes X-Request-Id: smoke-1
+sqlite3 data/agentnexus.db \
+  "select occurred_at, event_type, outcome, actor_name, request_id, asset_name, target, error_code, duration_ms
+   from audit_events order by occurred_at"                   # management actions, runtime/tool lifecycle, tool.called
+```
+
+Each request also emits one `request completed` log line with `request_id`, `status`, `duration_ms`, `bytes`, `principal`, and `error_code` (empty on success, `unauthenticated`/`permission_denied` on rejection).
+
 Config precedence: built-in defaults → YAML → `AGENTNEXUS_HTTP_ADDRESS` / `AGENTNEXUS_SHUTDOWN_TIMEOUT` / `AGENTNEXUS_DATABASE_PATH` / `AGENTNEXUS_RUNTIME_RECONCILE_INTERVAL` → validate. A missing YAML file is silently ignored; a present-but-invalid one is fatal. `runtime.reconcileInterval` (YAML: duration string, default 30s) sets the periodic sweep cadence; `0s` disables the sweep but keeps the startup replay. Negative values are rejected. `configs/dev.yaml` currently fails validation (`shutdownTimeout: 0s`), so do not use it as-is.
 
 Manual/phase-0 programs live in `examples/` (gitignored, so absent on a fresh clone):
@@ -95,6 +108,7 @@ Registry, startup replay, periodic sweep, and `:refresh-tools` all feed the same
 - `Migrate` accepts any `fs.FS`, runs `NNNNNN_name.sql` files in version order, one transaction each, and records them in `schema_migrations`. Production migrations are embedded via `migrations.FS` (`//go:embed *.sql`); tests use `testing/fstest.MapFS` for synthetic ones.
 - Schema (`000001_mcp_core.sql`): `assets` is a generic Kubernetes-style envelope (`kind`, `namespace`, `name`, `labels_json`, `enabled`, `revision`; UNIQUE on namespace+kind+name). `mcp_servers` is the 1:1 kind-specific extension keyed by `asset_id`, holding `runtime_spec_json` and timeouts in milliseconds. `server_status` holds observed runtime state. `credentials` is referenced by `mcp_servers.credential_id`. Future kinds (Skill, Agent, Workflow) are meant to reuse `assets`.
 - Schema (`000002_tool_catalog.sql`): `tool_snapshots` holds one row per refresh (`state` in building/active/superseded/failed, `generation`, `catalog_digest`, `server_revision`; a partial unique index enforces at most one `active` snapshot per server) and `tools` holds the normalized definitions keyed by `snapshot_id` (UNIQUE on `snapshot_id` + `backend_name`/`public_name`). `ListAggregated` returns only tools whose snapshot is `active`, whose `server_revision` equals `assets.revision`, and whose asset is enabled with `desired_state='running'` - a superseded or stale snapshot drops out of the catalog automatically.
+- Schema (`000003_audit_events.sql`): `audit_events` is append-only (`event_type`, `outcome` CHECK in success/error/cancelled, `actor_name`/`actor_role`, `request_id`, `asset_id` nullable FK -> `assets` ON DELETE SET NULL, `asset_name` as a redundant copy so events stay readable after the asset is gone, `target`, `runtime_id`, `error_code`, `duration_ms` nullable, `detail_json` default `'{}'`). Three indexes: `occurred_at DESC`, `(asset_id, occurred_at DESC)`, `(actor_name, occurred_at DESC)`. There is no read path in v0.1 - query the table with the `sqlite3` CLI.
 - Conventions: timestamps are UTC RFC3339Nano strings, and `Service.Register` normalizes its clock to UTC so the value it returns renders identically to what a later read returns; booleans are 0/1 integers; IDs are strings assigned by the caller (the repository rejects an empty ID). Range limits on timeouts and `max_in_flight` exist both as SQL CHECK constraints and in `server.Validate`; keep them in sync.
 - `ServerRepository.Create` writes `assets` + `mcp_servers` + `server_status` in one transaction. SQLite UNIQUE violations (extended code 2067) map to `server.ErrAlreadyExists`; `sql.ErrNoRows` maps to `server.ErrNotFound`. `WithClock` injects time for tests.
 
@@ -114,11 +128,22 @@ Registry, startup replay, periodic sweep, and `:refresh-tools` all feed the same
 - Header rules (`presentedSecret`): `Authorization: Bearer <key>` (scheme case-insensitive) wins; a non-Bearer scheme does not fall back to `X-API-Key`; otherwise `X-API-Key`; nothing → 401.
 - Failures reuse the error envelope with two codes: `unauthenticated` (401, adds `WWW-Authenticate: Bearer realm="agentnexus"`) and `permission_denied` (403, no challenge header). Messages are fixed and never echo the credential.
 - An empty `apiKeys` list is valid: the service starts, logs `no API keys configured; all requests will be rejected`, and everything except the probes returns 401. `Options.Authenticator == nil` (wiring bug) fails closed for all paths, probes included.
-- `auth.WithPrincipal`/`PrincipalFrom` is the only seam for reading the caller (currently unused by handlers; intended for audit/metrics).
+- `auth.WithPrincipal`/`PrincipalFrom` is the only seam for reading the caller: `withAuth` writes it, `observability.EnrichAuditInput` and the request log read it.
+
+### Audit and request logging (`internal/audit`, `internal/observability`, `migrations/000003_audit_events.sql`)
+
+- Two different facts, two different destinations: the per-request structured log (`internal/edge/httpapi/requestlog.go`) is ephemeral and answers "what did this HTTP request do"; `audit_events` is durable and answers "who changed or invoked what". A request log line never substitutes for an audit row and vice versa.
+- `internal/audit` is domain-only (no `net/http`, SQL, SDK, or `slog`): `EventType` (nine frozen values; unknown types are rejected), `Outcome` (success/error/cancelled), `Input` (what emitters build) vs `Event` (what `Recorder.Record` persists - it assigns the ID and a UTC `OccurredAt`), `Detail()` as the only detail builder, and `Repository.Append` as the single write path. `audit.ErrorCode(err)` maps domain sentinels to the detailed design §11.1 codes in exactly one place; `context.Canceled` deliberately maps to an empty code (cancellation is an `Outcome`, not an error code).
+- `Recorder.Record` never changes a business result: invalid input returns `ErrInvalidEvent` (a programming error) and storage errors pass through; every caller logs and continues. `Detail` is redacted structurally - `redactDetail` rejects non-objects, drops deny-listed keys (case/`-`/`_` insensitive: `endpoint`, `url`, `command`, `args`, `env`, `headers`, `path`, `credential`, `token`, `secret`, ...) with their values, and caps depth at 16 and size at 4 KiB. To keep a new field out of the audit table, add its key to the deny-list.
+- Emission points: HTTP handlers write `server.registered` / `server.refresh_requested` through `httpapi.Options.Auditor`; `app.Lifecycle` writes `tool.snapshot_published` / `tool.sync_failed`; and `observability.AuditObserver` implements both `gateway.CallObserver` (`tool.called`) and `runtime.Observer` (`runtime.started`/`restarted`/`stopped`/`failed`). `internal/observability` is the only package that knows audit + auth + gateway + runtime at once; `runtime`, `server`, and `tool` only declare consumer-side observer interfaces and never import `internal/audit` (only `gateway` does, for `Outcome`/`ErrorCode`).
+- Actor and request id come from `observability.EnrichAuditInput`, which reads `auth.PrincipalFrom` and `RequestIDFrom` from the request context. Background work (startup replay, periodic sweep) has no request context, so those rows legitimately have empty `actor_*`/`request_id`; never invent values for them.
+- Middleware order in `httpapi.NewHandler` is `withRequestLog(withAuth(mux))`: the request log must wrap auth so 401/403 responses still get a `request_id`, status, duration, and `error_code`. `withRequestLog` reuses an inbound `X-Request-Id` only when it matches `^[A-Za-z0-9._-]{1,64}$` (anything else is regenerated, preventing log injection) and always echoes the effective value in the response header.
+- The log line is assembled from a `*requestRecord` stored in the context; `withAuth` writes the principal and `writeError` writes the error code. `statusWriter` records status and bytes and **must** keep its `Unwrap`, because the MCP streamable HTTP handler reaches the `Flusher` through `http.NewResponseController`.
+- Authentication and authorization failures are logged but never written to `audit_events`; the audit table records business facts, not rejected traffic.
 
 ### HTTP API (`internal/edge/httpapi`)
 
-- `NewHandler` builds the mux, wraps it in `withAuth`, and depends on consumer-defined interfaces (`ServerRegistry` with Register + Get, plus `Authenticator`), not on the concrete service. Tests inject the real service over a temp SQLite database, or a stub for failure paths.
+- `NewHandler` builds the mux, wraps it in `withRequestLog` (outermost) and `withAuth`, and depends on consumer-defined interfaces (`ServerRegistry` with Register + Get, `ServerRefresher`, `Authenticator`, plus `AuditRecorder`), not on the concrete service. Tests inject the real service over a temp SQLite database, or a stub for failure paths; `Options.Auditor == nil` silently skips management-action audit events.
 - Routes: `GET /health/live`, `GET /health/ready`, `POST /api/v1/mcp-servers` (202 Accepted plus `Location`, because runtime start is asynchronous by design), `GET /api/v1/mcp-servers/{id}`, `POST /api/v1/mcp-servers/{id}:refresh-tools` (202, same async semantics). The action route is only registered when a `ServerRefresher` is supplied; `net/http` requires a wildcard segment to own a whole path segment, so the route is `POST .../{rest...}` and the handler splits `<id>:<action>` (`parseAction` in `mcp_server_handlers.go`). Unknown action or unknown id → 404; a non-runnable server (disabled or desired state stopped) → 409 `conflict` via `server.ErrNotRunnable`.
 - Wire format is defined by the DTOs in `dto.go`; domain types are never serialized directly. Timeouts travel as whole seconds (`connectSeconds` etc.), the runtime is a tagged union that only emits the active variant, and `desiredState` is not accepted on registration.
 - Errors use one envelope, `{"error":{"code":...,"message":...}}`, with codes `invalid_argument` (400), `unauthenticated` (401), `permission_denied` (403), `not_found` (404), `conflict` (409), `internal` (500). Domain sentinels are mapped in exactly one place, `writeDomainError`. Unexpected errors are logged with detail and returned as an opaque "internal error".
@@ -148,11 +173,12 @@ Registry, startup replay, periodic sweep, and `:refresh-tools` all feed the same
 ### App wiring (`internal/app`)
 
 - `app.Run` is the composition root. It also runs `Lifecycle`, which decorates the `ServerRegistry` handed to the HTTP layer: a successful `Register` enqueues the new ID (FIFO queue + dedup set, one worker goroutine) and the sync runs asynchronously on the application context, so the response stays `202`/`pending` and sync failures are only logged. `Lifecycle.Close` stops accepting triggers, cancels in-flight syncs and waits for the worker.
+- One `audit.Recorder` is built from `sqlite.NewAuditRepository` and handed to all three consumers: the HTTP layer (`Options.Auditor`), `Lifecycle` (`LifecycleOptions.Auditor`), and `observability.NewAuditObserver`, which is installed on both `runtime.Manager` (`WithObserver`) and `gateway.ToolCaller` (`WithObserver`). No other code path writes audit rows.
 - A failed sync leaves the server `degraded` with the previous snapshot still readable; the periodic sweep retries it, and `POST ...:refresh-tools` triggers it immediately.
 
 ### Package layout (from the detailed design)
 
-Done: `internal/tool`, `internal/runtime/{remote,process}`, `internal/mcpclient`, `internal/mcpadapter`, `internal/gateway`. Planned: `internal/runtime/docker`, `internal/auth`, `internal/audit`. Place new code in these packages rather than inventing new top-level ones.
+Done: `internal/tool`, `internal/runtime/{remote,process}`, `internal/mcpclient`, `internal/mcpadapter`, `internal/gateway`, `internal/auth`, `internal/audit`, `internal/observability`. Planned: `internal/runtime/docker`. Place new code in these packages rather than inventing new top-level ones.
 
 ## Conventions
 

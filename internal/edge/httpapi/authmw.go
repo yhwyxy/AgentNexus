@@ -28,7 +28,7 @@ func withAuth(next http.Handler, authenticator Authenticator, logger *slog.Logge
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if authenticator == nil {
 			logger.Error("no authenticator configured; rejecting request", "path", r.URL.Path)
-			writeError(w, http.StatusForbidden, codePermissionDenied, "permission denied")
+			writeError(w, r, http.StatusForbidden, codePermissionDenied, "permission denied")
 
 			return
 		}
@@ -39,16 +39,17 @@ func withAuth(next http.Handler, authenticator Authenticator, logger *slog.Logge
 		case err == nil && principal == nil:
 			next.ServeHTTP(w, r)
 		case err == nil:
-			// 唯一的调用者传递 seam：后续 audit/metrics 从 ctx 读取身份。
+			// 唯一的调用者传递 seam：审计、metrics 与请求日志都从 ctx 读取身份。
+			setRecordPrincipal(r.Context(), *principal)
 			next.ServeHTTP(w, r.WithContext(auth.WithPrincipal(r.Context(), *principal)))
 		case errors.Is(err, auth.ErrUnauthenticated):
 			w.Header().Set("WWW-Authenticate", `Bearer realm="agentnexus"`)
-			writeError(w, http.StatusUnauthorized, codeUnauthenticated, "authentication required")
+			writeError(w, r, http.StatusUnauthorized, codeUnauthenticated, "authentication required")
 		case errors.Is(err, auth.ErrPermissionDenied):
-			writeError(w, http.StatusForbidden, codePermissionDenied, "permission denied")
+			writeError(w, r, http.StatusForbidden, codePermissionDenied, "permission denied")
 		default:
 			logger.Error("authenticate request", "path", r.URL.Path, "error", err)
-			writeError(w, http.StatusInternalServerError, codeInternal, "internal error")
+			writeError(w, r, http.StatusInternalServerError, codeInternal, "internal error")
 		}
 	})
 }

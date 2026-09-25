@@ -16,6 +16,7 @@ import (
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 	"github.com/yhwyxy/AgentNexus/internal/app"
+	"github.com/yhwyxy/AgentNexus/internal/audit"
 	"github.com/yhwyxy/AgentNexus/internal/edge/httpapi"
 	"github.com/yhwyxy/AgentNexus/internal/gateway"
 	"github.com/yhwyxy/AgentNexus/internal/mcpadapter"
@@ -88,6 +89,7 @@ func startStdioStack(t *testing.T) *stdioStack {
 		Syncer:            tool.NewSyncService(servers, runtimes, clients, toolRepo, catalog),
 		Lister:            servers,
 		ReconcileInterval: 10 * time.Millisecond,
+		Auditor:           audit.NewRecorder(sqlite.NewAuditRepository(db)),
 		Logger:            testLogger(),
 	})
 	if err != nil {

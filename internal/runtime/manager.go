@@ -31,6 +31,8 @@ type ProviderManager struct {
 	servers   server.Repository
 	providers map[server.RuntimeType]Provider
 	locks     keyedLocker
+	// observer 只在构造期设置（WithObserver），之后只读；nil 表示不观察。
+	observer Observer
 
 	mu     sync.Mutex
 	active map[server.ID]managedInstance
@@ -67,6 +69,12 @@ func NewManager(servers server.Repository, providers ...Provider) (*ProviderMana
 		providers: registered,
 		active:    make(map[server.ID]managedInstance),
 	}, nil
+}
+
+// WithObserver 安装运行态观察者，只在构造后立即调用（非并发安全）。
+func (m *ProviderManager) WithObserver(observer Observer) *ProviderManager {
+	m.observer = observer
+	return m
 }
 
 func (m *ProviderManager) EnsureReady(ctx context.Context, requested server.Server) (Instance, error) {
@@ -135,6 +143,14 @@ func (m *ProviderManager) ensureLoaded(ctx context.Context, srv server.Server) (
 	}
 
 	m.setActive(srv.ID, managedInstance{instance: instance, provider: provider})
+	// 运行态事实在实例进入缓存后立即上报：即使随后状态持久化失败，实例已经在跑。
+	if m.observer != nil {
+		if hasCached {
+			m.observer.RuntimeRestarted(ctx, srv, cached.instance, instance)
+		} else {
+			m.observer.RuntimeStarted(ctx, srv, instance)
+		}
+	}
 	if err := m.persistEnsured(ctx, srv, instance); err != nil {
 		return Instance{}, err
 	}
@@ -165,6 +181,9 @@ func (m *ProviderManager) stopLoaded(ctx context.Context, srv server.Server) err
 			return m.recordFailure(ctx, srv, "runtime stop failed", fmt.Errorf("stop runtime provider: %w", err))
 		}
 		m.deleteActive(srv.ID)
+		if m.observer != nil {
+			m.observer.RuntimeStopped(ctx, srv, cached.instance)
+		}
 	}
 
 	status := srv.Status.CreateInput()
@@ -201,6 +220,7 @@ func (m *ProviderManager) Reconcile(ctx context.Context, id server.ID) error {
 // Close 停止全部活动实例并调用实现了 Releaser 的 Provider 做最终回收。
 // 关闭后 EnsureReady/Stop/Reconcile 一律返回 ErrManagerClosed:应用退出的顺序是
 // 先停 HTTP 与生命周期队列,再 Close 本管理器,最后关闭 MCP session。
+// 关停不产生运行态事件:此时进程即将退出,ctx 多半已被取消,写审计也无意义。
 func (m *ProviderManager) Close(ctx context.Context) error {
 	m.mu.Lock()
 	if m.closed {
@@ -313,6 +333,9 @@ func (m *ProviderManager) recordFailure(ctx context.Context, srv server.Server, 
 	status.ConsecutiveFailures++
 	if err := m.servers.UpdateStatus(ctx, srv.ID, status); err != nil {
 		return errors.Join(cause, fmt.Errorf("persist degraded runtime status: %w", err))
+	}
+	if m.observer != nil {
+		m.observer.RuntimeFailed(ctx, srv, cause)
 	}
 	return cause
 }

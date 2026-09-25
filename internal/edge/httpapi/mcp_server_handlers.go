@@ -10,6 +10,8 @@ import (
 	"net/http"
 	"strings"
 
+	"github.com/yhwyxy/AgentNexus/internal/audit"
+	"github.com/yhwyxy/AgentNexus/internal/observability"
 	"github.com/yhwyxy/AgentNexus/internal/server"
 )
 
@@ -41,13 +43,14 @@ const maxBodyBytes = 1 << 20
 type serverHandler struct {
 	registry  ServerRegistry
 	refresher ServerRefresher
+	auditor   AuditRecorder
 	logger    *slog.Logger
 }
 
 func (h *serverHandler) register(w http.ResponseWriter, r *http.Request) {
 	var req registerRequest
 	if err := decodeJSON(w, r, &req); err != nil {
-		writeError(w, http.StatusBadRequest, codeInvalidArgument, err.Error())
+		writeError(w, r, http.StatusBadRequest, codeInvalidArgument, err.Error())
 		return
 	}
 
@@ -56,6 +59,21 @@ func (h *serverHandler) register(w http.ResponseWriter, r *http.Request) {
 		h.writeDomainError(w, r, err)
 		return
 	}
+	// 审计先于响应写入：状态变更必须在它可见之前留下记录。
+	// Detail 只放非敏感形态字段——注册请求里可能带 endpoint、命令行与环境变量。
+	h.record(r.Context(), audit.Input{
+		Type:      audit.EventServerRegistered,
+		Outcome:   audit.OutcomeSuccess,
+		AssetID:   string(created.ID),
+		AssetName: created.Name,
+		Target:    string(created.ID),
+		Detail: audit.Detail(map[string]any{
+			"namespace":    created.Namespace,
+			"transport":    string(created.Spec.Transport),
+			"runtime_type": string(created.Spec.Runtime.Type),
+			"revision":     created.Revision,
+		}),
+	})
 
 	// 202：Runtime 启动与后端初始化在请求之后异步完成（详细设计 10.1）。
 	w.Header().Set("Location", selfLink(created.ID))
@@ -77,7 +95,7 @@ func (h *serverHandler) get(w http.ResponseWriter, r *http.Request) {
 func (h *serverHandler) action(w http.ResponseWriter, r *http.Request) {
 	id, action, ok := parseAction(r.PathValue("rest"))
 	if !ok || action != actionRefreshTools {
-		writeError(w, http.StatusNotFound, codeNotFound, "unknown action")
+		writeError(w, r, http.StatusNotFound, codeNotFound, "unknown action")
 		return
 	}
 	h.refreshTools(w, r, id)
@@ -91,8 +109,28 @@ func (h *serverHandler) refreshTools(w http.ResponseWriter, r *http.Request, id 
 		h.writeDomainError(w, r, err)
 		return
 	}
+	h.record(r.Context(), audit.Input{
+		Type:      audit.EventServerRefreshRequested,
+		Outcome:   audit.OutcomeSuccess,
+		AssetID:   string(srv.ID),
+		AssetName: srv.Name,
+		Target:    string(srv.ID),
+		Detail:    audit.Detail(map[string]any{"revision": srv.Revision}),
+	})
 	w.Header().Set("Location", selfLink(srv.ID))
 	writeJSON(w, http.StatusAccepted, toServerResponse(srv))
+}
+
+// record 写审计事件：Auditor 未装配（测试）时静默跳过。
+// 写失败只记 error 日志，绝不改变已经成功的业务结果。
+func (h *serverHandler) record(ctx context.Context, in audit.Input) {
+	if h.auditor == nil {
+		return
+	}
+	// 调用者与 request_id 从请求 ctx 补齐：注册请求的 Detail 里没有任何身份信息。
+	if err := h.auditor.Record(ctx, observability.EnrichAuditInput(ctx, in)); err != nil {
+		h.logger.Error("record audit event", "event_type", in.Type, "error", err)
+	}
 }
 
 // parseAction 拆分 "{id}:{action}"；ID 必须非空且不含 "/"（后者说明路径更深，非本路由语义）。
@@ -109,20 +147,20 @@ func parseAction(rest string) (server.ID, string, bool) {
 func (h *serverHandler) writeDomainError(w http.ResponseWriter, r *http.Request, err error) {
 	switch {
 	case errors.Is(err, server.ErrInvalid):
-		writeError(w, http.StatusBadRequest, codeInvalidArgument, err.Error())
+		writeError(w, r, http.StatusBadRequest, codeInvalidArgument, err.Error())
 	case errors.Is(err, server.ErrAlreadyExists):
-		writeError(w, http.StatusConflict, codeConflict, "server already exists")
+		writeError(w, r, http.StatusConflict, codeConflict, "server already exists")
 	case errors.Is(err, server.ErrNotRunnable):
-		writeError(w, http.StatusConflict, codeConflict, "server is not running")
+		writeError(w, r, http.StatusConflict, codeConflict, "server is not running")
 	case errors.Is(err, server.ErrNotFound):
-		writeError(w, http.StatusNotFound, codeNotFound, "server not found")
+		writeError(w, r, http.StatusNotFound, codeNotFound, "server not found")
 	default:
 		h.logger.Error("request failed",
 			"method", r.Method,
 			"path", r.URL.Path,
 			"error", err,
 		)
-		writeError(w, http.StatusInternalServerError, codeInternal, "internal error")
+		writeError(w, r, http.StatusInternalServerError, codeInternal, "internal error")
 	}
 }
 
@@ -146,7 +184,10 @@ type errorBody struct {
 	Message string `json:"message"`
 }
 
-func writeError(w http.ResponseWriter, status int, code, message string) {
+// writeError 是错误信封的唯一写入点：它同时把错误码写进请求记录，
+// 让请求日志（以及后续 metrics）不需要解析响应体就能拿到 error_code。
+func writeError(w http.ResponseWriter, r *http.Request, status int, code, message string) {
+	setRecordErrorCode(r.Context(), code)
 	writeJSON(w, status, errorResponse{Error: errorBody{Code: code, Message: message}})
 }
 

@@ -77,8 +77,10 @@ func (f *fakeSyncer) Sync(ctx context.Context, id server.ID) (tool.SyncResult, e
 		return tool.SyncResult{}, err
 	}
 	return tool.SyncResult{
-		Snapshot: tool.Snapshot{ServerID: id, Generation: 1, ToolCount: 2, State: tool.SnapshotActive},
-		Changed:  true,
+		Snapshot: tool.Snapshot{
+			ID: "snap-" + string(id), ServerID: id, Generation: 1, ToolCount: 2, State: tool.SnapshotActive,
+		},
+		Changed: true,
 	}, nil
 }
 
@@ -115,7 +117,9 @@ func waitForCalls(t *testing.T, syncer *fakeSyncer, want int) []server.ID {
 
 func newTestLifecycle(t *testing.T, syncer *fakeSyncer, registry *fakeRegistry, opts ...func(*app.LifecycleOptions)) *app.Lifecycle {
 	t.Helper()
-	options := app.LifecycleOptions{Registry: registry, Syncer: syncer, Logger: testLogger()}
+	options := app.LifecycleOptions{
+		Registry: registry, Syncer: syncer, Auditor: &recordingAuditor{}, Logger: testLogger(),
+	}
 	for _, apply := range opts {
 		apply(&options)
 	}
@@ -157,7 +161,8 @@ func TestLifecycleSyncsAfterRegister(t *testing.T) {
 	if err != nil {
 		t.Fatalf("get: %v", err)
 	}
-	if got.ID != "srv-1" || len(registry.gets) != 1 || registry.gets[0] != "srv-1" {
+	// gets 可能多于一次：同步结束后的审计事件会再读一次资产名（见 Lifecycle.assetName）。
+	if got.ID != "srv-1" || len(registry.gets) == 0 || registry.gets[0] != "srv-1" {
 		t.Fatalf("get delegated to %v returning %#v", registry.gets, got)
 	}
 }

@@ -80,6 +80,7 @@ func TestProductionMigrationCreatesCoreTables(t *testing.T) {
 		"server_status",
 		"tool_snapshots",
 		"tools",
+		"audit_events",
 	}
 
 	for _, table := range expectedTables {
@@ -108,7 +109,7 @@ WHERE type = 'table' AND name = ?
 		t.Fatalf("query migration version: %v", err)
 	}
 
-	if version != 2 {
-		t.Fatalf("migration version = %d, want 2", version)
+	if version != 3 {
+		t.Fatalf("migration version = %d, want 3", version)
 	}
 }

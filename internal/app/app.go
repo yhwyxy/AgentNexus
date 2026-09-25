@@ -13,6 +13,7 @@ import (
 	"os/signal"
 	"syscall"
 
+	"github.com/yhwyxy/AgentNexus/internal/audit"
 	"github.com/yhwyxy/AgentNexus/internal/auth"
 	"github.com/yhwyxy/AgentNexus/internal/config"
 	"github.com/yhwyxy/AgentNexus/internal/edge/httpapi"
@@ -65,6 +66,10 @@ func Run(configPath string) error {
 
 	servers := sqlite.NewServerRepository(db)
 	registry := server.NewService(servers)
+	// 审计只有一条写入路径:所有发射点(HTTP 管理动作、生命周期、Runtime、工具调用)
+	// 共用同一个 Recorder,写入失败只记日志,绝不改变业务结果。
+	recorder := audit.NewRecorder(sqlite.NewAuditRepository(db))
+	observer := observability.NewAuditObserver(recorder, logger)
 	toolRepo := sqlite.NewToolRepository(db)
 	catalog := tool.NewCatalog(toolRepo)
 	clients := mcpclient.NewManager(mcpadapter.NewConnector())
@@ -73,6 +78,7 @@ func Run(configPath string) error {
 	if err != nil {
 		return fmt.Errorf("create runtime manager: %w", err)
 	}
+	runtimes.WithObserver(observer)
 	// 子进程由 ProviderManager 持有:关闭顺序是先停生命周期队列,再逐个终止子进程,
 	// 最后关闭 MCP session。defer 是后进先出,因此这里声明在 lifecycle 之前。
 	defer func() {
@@ -89,6 +95,7 @@ func Run(configPath string) error {
 	lifecycle, err := NewLifecycle(LifecycleOptions{
 		Registry:          registry,
 		Syncer:            syncer,
+		Auditor:           recorder,
 		Lister:            servers,
 		ReconcileInterval: cfg.Runtime.ReconcileInterval,
 		Logger:            logger,
@@ -107,6 +114,7 @@ func Run(configPath string) error {
 	if err != nil {
 		return fmt.Errorf("create tool caller: %w", err)
 	}
+	caller.WithObserver(observer)
 	virtual, err := gateway.NewVirtualServer(catalog, caller)
 	if err != nil {
 		return fmt.Errorf("create virtual MCP server: %w", err)
@@ -123,6 +131,7 @@ func Run(configPath string) error {
 			Refresher:     lifecycle,
 			MCP:           mcpHandler,
 			Authenticator: authorizer,
+			Auditor:       recorder,
 			Logger:        logger,
 		}),
 	)
