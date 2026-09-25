@@ -8,7 +8,6 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
-	"strings"
 	"testing"
 	"time"
 
@@ -79,19 +78,17 @@ func TestRegisterTriggersAsyncToolSyncAndCatalogPublish(t *testing.T) {
 		t.Fatalf("create MCP handler: %v", err)
 	}
 	httpServer := httptest.NewServer(httpapi.NewHandler(httpapi.Options{
-		Registry:  lifecycle,
-		Refresher: lifecycle,
-		MCP:       mcpHandler,
-		Logger:    testLogger(),
+		Registry:      lifecycle,
+		Refresher:     lifecycle,
+		MCP:           mcpHandler,
+		Authenticator: testAuthorizer(t),
+		Logger:        testLogger(),
 	}))
 	defer httpServer.Close()
 
 	body := fmt.Sprintf(`{"name":"backend","transport":"streamable_http",
 		"runtime":{"type":"remote","remote":{"endpoint":%q}}}`, backend.HTTP.URL)
-	resp, err := http.Post(httpServer.URL+"/api/v1/mcp-servers", "application/json", strings.NewReader(body))
-	if err != nil {
-		t.Fatalf("register request: %v", err)
-	}
+	resp := doAuthorized(t, http.MethodPost, httpServer.URL+"/api/v1/mcp-servers", body)
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusAccepted {
 		raw, _ := io.ReadAll(resp.Body)
@@ -128,7 +125,7 @@ func TestRegisterTriggersAsyncToolSyncAndCatalogPublish(t *testing.T) {
 	}
 
 	client := mcp.NewClient(&mcp.Implementation{Name: "app-test-client", Version: "1.0.0"}, nil)
-	session, err := client.Connect(ctx, &mcp.StreamableClientTransport{Endpoint: httpServer.URL + "/mcp"}, nil)
+	session, err := client.Connect(ctx, streamableTransport(httpServer.URL+"/mcp", testAdminSecret), nil)
 	if err != nil {
 		t.Fatalf("connect MCP client: %v", err)
 	}
@@ -152,10 +149,7 @@ func TestRegisterTriggersAsyncToolSyncAndCatalogPublish(t *testing.T) {
 
 func getServerStatus(t *testing.T, baseURL, id string) (string, int64) {
 	t.Helper()
-	resp, err := http.Get(baseURL + "/api/v1/mcp-servers/" + id)
-	if err != nil {
-		t.Fatalf("get server: %v", err)
-	}
+	resp := doAuthorized(t, http.MethodGet, baseURL+"/api/v1/mcp-servers/"+id, "")
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
 		raw, _ := io.ReadAll(resp.Body)

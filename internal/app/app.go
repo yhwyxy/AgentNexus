@@ -13,6 +13,7 @@ import (
 	"os/signal"
 	"syscall"
 
+	"github.com/yhwyxy/AgentNexus/internal/auth"
 	"github.com/yhwyxy/AgentNexus/internal/config"
 	"github.com/yhwyxy/AgentNexus/internal/edge/httpapi"
 	"github.com/yhwyxy/AgentNexus/internal/gateway"
@@ -36,6 +37,17 @@ func Run(configPath string) error {
 	}
 
 	logger := observability.NewLogger()
+
+	// 认证在最早的失败点完成：密钥表非法（角色拼错、密钥重复等）直接拒绝启动。
+	// 空密钥表是合法配置——服务照常启动，但除探针外全部请求都会被拒绝。
+	authorizer, err := auth.NewAuthorizer(toKeyConfigs(cfg.Security.APIKeys), auth.DefaultPolicy())
+	if err != nil {
+		return fmt.Errorf("build API key authorizer: %w", err)
+	}
+	if len(cfg.Security.APIKeys) == 0 {
+		logger.Warn("no API keys configured; all requests will be rejected")
+	}
+
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
@@ -107,10 +119,11 @@ func Run(configPath string) error {
 	httpServer := httpapi.NewServer(
 		cfg.Server.HTTPAddress,
 		httpapi.NewHandler(httpapi.Options{
-			Registry:  lifecycle,
-			Refresher: lifecycle,
-			MCP:       mcpHandler,
-			Logger:    logger,
+			Registry:      lifecycle,
+			Refresher:     lifecycle,
+			MCP:           mcpHandler,
+			Authenticator: authorizer,
+			Logger:        logger,
 		}),
 	)
 	serverErr := make(chan error, 1)
@@ -135,4 +148,19 @@ func Run(configPath string) error {
 		logger.Info("HTTP server stopped")
 		return nil
 	}
+}
+
+// toKeyConfigs 只做形态转换：角色字符串的合法性由 auth.NewAuthorizer 判定，
+// 校验语义只存在一处。
+func toKeyConfigs(configured []config.APIKeyConfig) []auth.KeyConfig {
+	keys := make([]auth.KeyConfig, 0, len(configured))
+	for _, entry := range configured {
+		keys = append(keys, auth.KeyConfig{
+			Name:   entry.Name,
+			Role:   auth.Role(entry.Role),
+			Secret: entry.Secret,
+		})
+	}
+
+	return keys
 }

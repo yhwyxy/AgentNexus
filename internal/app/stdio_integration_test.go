@@ -106,10 +106,11 @@ func startStdioStack(t *testing.T) *stdioStack {
 		t.Fatalf("create MCP handler: %v", err)
 	}
 	httpSrv := httptest.NewServer(httpapi.NewHandler(httpapi.Options{
-		Registry:  lifecycle,
-		Refresher: lifecycle,
-		MCP:       mcpHandler,
-		Logger:    testLogger(),
+		Registry:      lifecycle,
+		Refresher:     lifecycle,
+		MCP:           mcpHandler,
+		Authenticator: testAuthorizer(t),
+		Logger:        testLogger(),
 	}))
 
 	stack := &stdioStack{
@@ -146,10 +147,7 @@ func startStdioStack(t *testing.T) *stdioStack {
 	if err != nil {
 		t.Fatalf("encode registration body: %v", err)
 	}
-	resp, err := http.Post(stack.URL+"/api/v1/mcp-servers", "application/json", strings.NewReader(string(body)))
-	if err != nil {
-		t.Fatalf("register: %v", err)
-	}
+	resp := doAuthorized(t, http.MethodPost, stack.URL+"/api/v1/mcp-servers", string(body))
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusAccepted {
 		raw, _ := io.ReadAll(resp.Body)
@@ -211,7 +209,7 @@ func (s *stdioStack) childPID(t *testing.T) int {
 func (s *stdioStack) connect(t *testing.T) *mcp.ClientSession {
 	t.Helper()
 	session, err := mcp.NewClient(&mcp.Implementation{Name: "stdio-app-test", Version: "1.0.0"}, nil).
-		Connect(context.Background(), &mcp.StreamableClientTransport{Endpoint: s.URL + "/mcp"}, nil)
+		Connect(context.Background(), streamableTransport(s.URL+"/mcp", testAdminSecret), nil)
 	if err != nil {
 		t.Fatalf("connect MCP client: %v", err)
 	}
@@ -286,10 +284,7 @@ func killProcess(t *testing.T, pid int) {
 // refreshTools 排队一次快照刷新,并等待新的子进程被拉起且目录重新可见。
 func (s *stdioStack) refreshTools(t *testing.T, previousPID int) int {
 	t.Helper()
-	resp, err := http.Post(s.URL+"/api/v1/mcp-servers/stdio-1:refresh-tools", "application/json", nil)
-	if err != nil {
-		t.Fatalf("refresh-tools: %v", err)
-	}
+	resp := doAuthorized(t, http.MethodPost, s.URL+"/api/v1/mcp-servers/stdio-1:refresh-tools", "")
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusAccepted {
 		raw, _ := io.ReadAll(resp.Body)

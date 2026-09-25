@@ -8,7 +8,6 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
-	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -34,6 +33,7 @@ import (
 type appStack struct {
 	url       string
 	lifecycle *app.Lifecycle
+	servers   server.Repository
 	close     func()
 }
 
@@ -79,15 +79,17 @@ func startStack(t *testing.T, dbPath string, reconcileInterval time.Duration) *a
 		t.Fatalf("create MCP handler: %v", err)
 	}
 	httpServer := httptest.NewServer(httpapi.NewHandler(httpapi.Options{
-		Registry:  lifecycle,
-		Refresher: lifecycle,
-		MCP:       mcpHandler,
-		Logger:    testLogger(),
+		Registry:      lifecycle,
+		Refresher:     lifecycle,
+		MCP:           mcpHandler,
+		Authenticator: testAuthorizer(t),
+		Logger:        testLogger(),
 	}))
 
 	return &appStack{
 		url:       httpServer.URL,
 		lifecycle: lifecycle,
+		servers:   servers,
 		close: func() {
 			httpServer.Close()
 			closeLifecycle(t, lifecycle)
@@ -120,10 +122,7 @@ func registerServer(t *testing.T, baseURL, name, endpoint string, enabled *bool)
 	body := fmt.Sprintf(`{%s"name":%q,"transport":"streamable_http",
 		"runtime":{"type":"remote","remote":{"endpoint":%q}}}`, enabledField, name, endpoint)
 
-	resp, err := http.Post(baseURL+"/api/v1/mcp-servers", "application/json", strings.NewReader(body))
-	if err != nil {
-		t.Fatalf("register request: %v", err)
-	}
+	resp := doAuthorized(t, http.MethodPost, baseURL+"/api/v1/mcp-servers", body)
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusAccepted {
 		raw, _ := io.ReadAll(resp.Body)
@@ -168,9 +167,15 @@ func waitForReady(t *testing.T, baseURL, id string) {
 
 func listToolNames(t *testing.T, httpURL string) []string {
 	t.Helper()
+
+	return listToolNamesAs(t, httpURL, testAdminSecret)
+}
+
+func listToolNamesAs(t *testing.T, httpURL, secret string) []string {
+	t.Helper()
 	ctx := context.Background()
 	client := mcp.NewClient(&mcp.Implementation{Name: "app-test-client", Version: "1.0.0"}, nil)
-	session, err := client.Connect(ctx, &mcp.StreamableClientTransport{Endpoint: httpURL + "/mcp"}, nil)
+	session, err := client.Connect(ctx, streamableTransport(httpURL+"/mcp", secret), nil)
 	if err != nil {
 		t.Fatalf("connect MCP client: %v", err)
 	}
@@ -259,10 +264,7 @@ func TestRefreshToolsEndpointTriggersReload(t *testing.T) {
 	waitForReady(t, stack.url, id)
 	before := backend.ListToolsCount()
 
-	resp, err := http.Post(stack.url+"/api/v1/mcp-servers/"+id+":refresh-tools", "application/json", nil)
-	if err != nil {
-		t.Fatalf("refresh request: %v", err)
-	}
+	resp := doAuthorized(t, http.MethodPost, stack.url+"/api/v1/mcp-servers/"+id+":refresh-tools", "")
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusAccepted {
 		raw, _ := io.ReadAll(resp.Body)
@@ -293,10 +295,7 @@ func TestRefreshToolsEndpointRejectsUnknownAndNonRunnable(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			resp, err := http.Post(stack.url+tt.path, "application/json", nil)
-			if err != nil {
-				t.Fatalf("request: %v", err)
-			}
+			resp := doAuthorized(t, http.MethodPost, stack.url+tt.path, "")
 			defer resp.Body.Close()
 			if resp.StatusCode != tt.wantCode {
 				raw, _ := io.ReadAll(resp.Body)

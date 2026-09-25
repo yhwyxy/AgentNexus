@@ -9,3 +9,17 @@ database:
 # 运行态收敛：启动重放之后按该间隔重试未收敛的 Server，0 表示关闭周期巡检。
 runtime:
   reconcileInterval: 30s
+
+# 认证：key 与 keyEnv 互斥且必须给一个；keyEnv 指向环境变量，避免把密钥写进仓库。
+# 角色：admin 可调管理 API 与 /mcp；agent 只能调 /mcp。
+# 未列出的路径默认拒绝；/health/live 与 /health/ready 无需凭证。
+# 运行前先导出这两个变量，否则启动会因为环境变量缺失而失败：
+#   export AGENTNEXUS_ADMIN_KEY=... AGENTNEXUS_AGENT_KEY=...
+security:
+  apiKeys:
+    - name: admin
+      role: admin
+      keyEnv: AGENTNEXUS_ADMIN_KEY
+    - name: ci-agent
+      role: agent
+      keyEnv: AGENTNEXUS_AGENT_KEY
