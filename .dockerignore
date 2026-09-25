@@ -1,0 +1,12 @@
+# 构建上下文排除项:只保留编译所需源码与配置模板。
+.git
+.gitignore
+bin/
+data/
+docs/
+examples/
+*.db
+*.db-shm
+*.db-wal
+tmp/
+.DS_Store

@@ -5,7 +5,22 @@ import (
 	"net/url"
 	"path/filepath"
 	"regexp"
+	"strings"
 	"time"
+)
+
+// Docker 资源区间是校验层与 HostAccessPolicy 共用的冻结值(v0.1)。
+const (
+	minDockerMemoryBytes = 16 << 20 // 16 MiB
+	maxDockerMemoryBytes = 8 << 30  // 8 GiB
+	minDockerCPUs        = 0.1
+	maxDockerCPUs        = 8.0
+)
+
+// networkModeNone / networkModeBridge 是 v0.1 允许的显式网络模式(空串等同 bridge)。
+const (
+	networkModeNone   = "none"
+	networkModeBridge = "bridge"
 )
 
 var (
@@ -65,10 +80,7 @@ func validateRuntime(spec Spec) error {
 		return validateProcess(*spec.Runtime.Process)
 
 	case RuntimeDocker:
-		if spec.Runtime.Docker.Image == "" {
-			return fmt.Errorf("docker image must not be empty")
-		}
-		return nil
+		return validateDocker(spec)
 
 	default:
 		return fmt.Errorf("unsupported runtime type %q", spec.Runtime.Type)
@@ -141,6 +153,72 @@ func validateProcess(spec ProcessSpec) error {
 			return fmt.Errorf("process env key %q is not a valid environment variable name", key)
 		}
 	}
+	return nil
+}
+
+// validateDocker 只检查形状;宿主机挂载是否被允许由 HostAccessPolicy 判定
+// (见 internal/runtime/hostaccess),这里不重复允许清单逻辑。
+func validateDocker(spec Spec) error {
+	docker := spec.Runtime.Docker
+	if strings.TrimSpace(docker.Image) == "" || strings.ContainsAny(docker.Image, " \t\n") {
+		return fmt.Errorf("docker image must be a single non-empty reference")
+	}
+	for i, arg := range docker.Command {
+		if arg == "" {
+			return fmt.Errorf("docker command argument %d must not be empty", i)
+		}
+	}
+	for key := range docker.Env {
+		if !envNamePattern.MatchString(key) {
+			return fmt.Errorf("docker env key %q is not a valid environment variable name", key)
+		}
+	}
+	for _, mount := range docker.Mounts {
+		if !filepath.IsAbs(mount.Source) {
+			return fmt.Errorf("docker mount source %q must be an absolute path", mount.Source)
+		}
+		if filepath.Clean(mount.Source) == string(filepath.Separator) {
+			return fmt.Errorf("docker mount source must not be the host root")
+		}
+		if !filepath.IsAbs(mount.Target) {
+			return fmt.Errorf("docker mount target %q must be an absolute path", mount.Target)
+		}
+		if filepath.Clean(mount.Target) == string(filepath.Separator) {
+			return fmt.Errorf("docker mount target must not be the container root")
+		}
+	}
+	switch docker.NetworkMode {
+	case "", string(networkModeNone), string(networkModeBridge):
+	default:
+		return fmt.Errorf("docker network mode %q is not supported", docker.NetworkMode)
+	}
+	if docker.MemoryBytes != 0 && (docker.MemoryBytes < minDockerMemoryBytes || docker.MemoryBytes > maxDockerMemoryBytes) {
+		return fmt.Errorf("docker memoryBytes must be 0 or between %d and %d", minDockerMemoryBytes, maxDockerMemoryBytes)
+	}
+	if docker.CPUs != 0 && (docker.CPUs < minDockerCPUs || docker.CPUs > maxDockerCPUs) {
+		return fmt.Errorf("docker cpus must be 0 or between %g and %g", minDockerCPUs, maxDockerCPUs)
+	}
+
+	switch spec.Transport {
+	case TransportStreamableHTTP:
+		if docker.Port < 1 || docker.Port > 65535 {
+			return fmt.Errorf("docker streamable_http runtime requires a container port between 1 and 65535")
+		}
+		if docker.EndpointPath != "" && !strings.HasPrefix(docker.EndpointPath, "/") {
+			return fmt.Errorf("docker endpoint path must start with /")
+		}
+		if docker.NetworkMode == string(networkModeNone) {
+			return fmt.Errorf("docker streamable_http runtime can not publish a port with network mode none")
+		}
+	case TransportStdio:
+		if docker.Port != 0 {
+			return fmt.Errorf("docker stdio runtime must not set a container port")
+		}
+		if docker.EndpointPath != "" {
+			return fmt.Errorf("docker stdio runtime must not set an endpoint path")
+		}
+	}
+
 	return nil
 }
 
