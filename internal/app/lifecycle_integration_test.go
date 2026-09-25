@@ -56,6 +56,8 @@ func TestRegisterTriggersAsyncToolSyncAndCatalogPublish(t *testing.T) {
 	}
 	lifecycle, err := app.NewLifecycle(app.LifecycleOptions{
 		Registry:          registry,
+		Runtime:           runtimes,
+		Catalog:           catalog,
 		Syncer:            tool.NewSyncService(servers, runtimes, clients, toolRepo, catalog),
 		Lister:            servers,
 		ReconcileInterval: 10 * time.Millisecond,

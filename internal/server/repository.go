@@ -44,6 +44,20 @@ func (s Status) CreateInput() CreateStatusInput {
 	}
 }
 
+// UpdateInput 是 Update 的可变字段集合：PUT 语义下的全量替换。
+// namespace/name/transport 不可变（改名即新资产，transport 决定 runtime 矩阵）；
+// Enabled 与 DesiredState 有专责写路径（SetEnabled/SetDesiredState），
+// 因为它们不改变配置版本，不能递增 Revision。
+type UpdateInput struct {
+	DisplayName  string
+	Description  string
+	Labels       map[string]string
+	Runtime      RuntimeSpec
+	CredentialID *string
+	Timeouts     TimeoutSpec
+	Limits       LimitSpec
+}
+
 // Repository 是 Server 持久化的领域接口。
 // 实现位于 adapter 层（internal/storage/sqlite）；本接口不得引入
 // SQL、MCP SDK、HTTP 或 Docker SDK 类型。
@@ -60,14 +74,23 @@ type Repository interface {
 	// ListEnabled 返回所有 enabled=true 的 Server。
 	ListEnabled(ctx context.Context) ([]Server, error)
 
-	// UpdateSpec 以 expectedRevision 做乐观锁更新 Spec 并递增 Revision。
+	// List 返回全部 Server，按 namespace、name 排序（稳定且在存储层完成）。
+	List(ctx context.Context) ([]Server, error)
+
+	// Update 以 expectedRevision 做乐观锁，全量替换 UpdateInput 描述的可变字段
+	// 并递增 Revision（配置版本）。transport 与 desired_state 不在本次写入范围内。
 	// 无匹配行（revision 过期或 Server 已删除）返回 ErrConflict。
-	UpdateSpec(ctx context.Context, id ID, expectedRevision int64, mutate func(*Spec) error) (Server, error)
+	Update(ctx context.Context, id ID, expectedRevision int64, in UpdateInput) (Server, error)
 
 	// UpdateStatus 以观测状态覆盖 Status（不触碰 Spec/Revision）。
 	// 不存在返回 ErrNotFound。
 	UpdateStatus(ctx context.Context, id ID, input CreateStatusInput) error
 
-	// SetEnabled 启用/停用 Server；不存在返回 ErrNotFound。
-	SetEnabled(ctx context.Context, id ID, enabled bool) error
+	// SetEnabled 启用/停用 Server 并返回写入后的快照。
+	// enabled 是运行意图而非配置，因此不递增 Revision。不存在返回 ErrNotFound。
+	SetEnabled(ctx context.Context, id ID, enabled bool) (Server, error)
+
+	// SetDesiredState 写入期望运行态并返回写入后的快照。
+	// desiredState 是运行意图而非配置，因此不递增 Revision。不存在返回 ErrNotFound。
+	SetDesiredState(ctx context.Context, id ID, state DesiredState) (Server, error)
 }

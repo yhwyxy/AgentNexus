@@ -59,6 +59,8 @@ func startStack(t *testing.T, dbPath string, reconcileInterval time.Duration) *a
 	}
 	lifecycle, err := app.NewLifecycle(app.LifecycleOptions{
 		Registry:          registry,
+		Runtime:           runtimes,
+		Catalog:           catalog,
 		Syncer:            tool.NewSyncService(servers, runtimes, clients, sqlite.NewToolRepository(db), catalog),
 		Lister:            servers,
 		ReconcileInterval: reconcileInterval,
@@ -293,7 +295,7 @@ func TestRefreshToolsEndpointRejectsUnknownAndNonRunnable(t *testing.T) {
 	}{
 		{"missing server", "/api/v1/mcp-servers/ghost:refresh-tools", http.StatusNotFound, "not_found"},
 		{"disabled server", "/api/v1/mcp-servers/" + id + ":refresh-tools", http.StatusConflict, "conflict"},
-		{"unknown action", "/api/v1/mcp-servers/" + id + ":restart", http.StatusNotFound, "not_found"},
+		{"unknown action", "/api/v1/mcp-servers/" + id + ":bogus", http.StatusNotFound, "not_found"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {

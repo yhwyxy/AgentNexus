@@ -28,6 +28,33 @@ server_phase() { # id
 	api_get "/api/v1/mcp-servers/$1" | grep -o '"phase":"[a-z]*"' | head -1 | cut -d'"' -f4
 }
 
+server_revision() { # id
+	api_get "/api/v1/mcp-servers/$1" | grep -o '"revision":[0-9]*' | head -1 | cut -d: -f2
+}
+
+# --- 管理 API:列表 / 更新 / 动作 ---
+# 均断言 HTTP 状态码,失败时把响应体一起打出来(错误信封里有 code 与 message)。
+
+api_put() { # path json expected_status -> response body
+	local path=$1 body=$2 want=$3 out status
+	out=$(mktemp)
+	status=$(smoke_curl -o "$out" -w '%{http_code}' -X PUT "$SMOKE_BASE_URL$path" \
+		-H "Authorization: Bearer $SMOKE_API_KEY" -H 'Content-Type: application/json' -d "$body")
+	[ "$status" = "$want" ] || fail "PUT $path status = $status, want $want; body: $(cat "$out")"
+	cat "$out"
+	rm -f "$out"
+}
+
+api_action() { # id action expected_status -> response body
+	local id=$1 action=$2 want=$3 out status
+	out=$(mktemp)
+	status=$(smoke_curl -o "$out" -w '%{http_code}' -X POST "$SMOKE_BASE_URL/api/v1/mcp-servers/$id:$action" \
+		-H "Authorization: Bearer $SMOKE_API_KEY")
+	[ "$status" = "$want" ] || fail ":$action status = $status, want $want; body: $(cat "$out")"
+	cat "$out"
+	rm -f "$out"
+}
+
 wait_phase() { # id expected_phase timeout_seconds
 	local id=$1 want=$2 deadline=$((SECONDS + $3)) phase=""
 	while ((SECONDS < deadline)); do

@@ -119,7 +119,12 @@ func TestReplaceSnapshotRejectsStaleRevision(t *testing.T) {
 	if err := servers.Create(ctx, srv); err != nil {
 		t.Fatal(err)
 	}
-	srv, err := servers.UpdateSpec(ctx, srv.ID, 1, func(spec *server.Spec) error { spec.Timeouts.List += time.Second; return nil })
+	srv, err := servers.Update(ctx, srv.ID, 1, server.UpdateInput{
+		Labels:   srv.Labels,
+		Runtime:  srv.Spec.Runtime,
+		Timeouts: server.TimeoutSpec{Connect: srv.Spec.Timeouts.Connect, List: srv.Spec.Timeouts.List + time.Second, Call: srv.Spec.Timeouts.Call},
+		Limits:   srv.Spec.Limits,
+	})
 	if err != nil {
 		t.Fatal(err)
 	}

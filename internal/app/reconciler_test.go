@@ -274,19 +274,38 @@ func TestLifecycleCloseStopsReconciler(t *testing.T) {
 }
 
 func TestNewLifecycleRequiresDependencies(t *testing.T) {
+	complete := func() app.LifecycleOptions {
+		return app.LifecycleOptions{
+			Registry: &fakeRegistry{},
+			Syncer:   &fakeSyncer{},
+			Auditor:  &recordingAuditor{},
+			Runtime:  &fakeConverger{},
+			Catalog:  &fakeCatalog{},
+		}
+	}
 	tests := []struct {
-		name string
-		opts app.LifecycleOptions
+		name   string
+		remove func(*app.LifecycleOptions)
 	}{
-		{"missing registry", app.LifecycleOptions{Syncer: &fakeSyncer{}, Auditor: &recordingAuditor{}}},
-		{"missing syncer", app.LifecycleOptions{Registry: &fakeRegistry{}, Auditor: &recordingAuditor{}}},
-		{"missing auditor", app.LifecycleOptions{Registry: &fakeRegistry{}, Syncer: &fakeSyncer{}}},
+		{"missing registry", func(o *app.LifecycleOptions) { o.Registry = nil }},
+		{"missing syncer", func(o *app.LifecycleOptions) { o.Syncer = nil }},
+		{"missing auditor", func(o *app.LifecycleOptions) { o.Auditor = nil }},
+		{"missing runtime converger", func(o *app.LifecycleOptions) { o.Runtime = nil }},
+		{"missing catalog invalidator", func(o *app.LifecycleOptions) { o.Catalog = nil }},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			if _, err := app.NewLifecycle(tt.opts); err == nil {
+			opts := complete()
+			tt.remove(&opts)
+			if _, err := app.NewLifecycle(opts); err == nil {
 				t.Fatal("NewLifecycle accepted incomplete options")
 			}
 		})
 	}
+
+	lifecycle, err := app.NewLifecycle(complete())
+	if err != nil {
+		t.Fatalf("NewLifecycle rejected complete options: %v", err)
+	}
+	closeLifecycle(t, lifecycle)
 }

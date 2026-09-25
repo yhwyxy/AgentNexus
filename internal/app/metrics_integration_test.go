@@ -66,6 +66,8 @@ func startMetricsStack(t *testing.T) *metricsStack {
 	catalog := tool.NewCatalog(toolRepo)
 	lifecycle, err := app.NewLifecycle(app.LifecycleOptions{
 		Registry:          server.NewService(servers),
+		Runtime:           runtimes,
+		Catalog:           catalog,
 		Syncer:            tool.NewSyncService(servers, runtimes, clients, toolRepo, catalog),
 		Lister:            servers,
 		ReconcileInterval: 10 * time.Millisecond,

@@ -2,6 +2,7 @@ package sqlite_test
 
 import (
 	"context"
+	"database/sql"
 	"errors"
 	"path/filepath"
 	"reflect"
@@ -15,6 +16,13 @@ import (
 
 func newTestRepo(t *testing.T) (*sqlite.ServerRepository, context.Context) {
 	t.Helper()
+	repo, _, ctx := newTestRepoWithDB(t)
+	return repo, ctx
+}
+
+// newTestRepoWithDB 额外返回底层连接，供需要预置关联行（如 credentials 外键）的用例使用。
+func newTestRepoWithDB(t *testing.T) (*sqlite.ServerRepository, *sql.DB, context.Context) {
+	t.Helper()
 	ctx := context.Background()
 	db, err := sqlite.Open(ctx, filepath.Join(t.TempDir(), "test.db"))
 	if err != nil {
@@ -25,7 +33,7 @@ func newTestRepo(t *testing.T) (*sqlite.ServerRepository, context.Context) {
 	if err := sqlite.Migrate(ctx, db, migrations.FS); err != nil {
 		t.Fatalf("migrate: %v", err)
 	}
-	return sqlite.NewServerRepository(db), ctx
+	return sqlite.NewServerRepository(db), db, ctx
 }
 
 func remoteServer() server.Server {
@@ -127,8 +135,8 @@ func TestServerRepositoryListEnabled(t *testing.T) {
 	}
 }
 
-func TestServerRepositoryUpdateSpec(t *testing.T) {
-	repo, ctx := newTestRepo(t)
+func TestServerRepositoryUpdate(t *testing.T) {
+	repo, db, ctx := newTestRepoWithDB(t)
 	t0 := time.Date(2026, 9, 20, 10, 0, 0, 0, time.UTC)
 	now, advance := fixedClock(t0)
 	repo.WithClock(now)
@@ -136,16 +144,31 @@ func TestServerRepositoryUpdateSpec(t *testing.T) {
 	if err := repo.Create(ctx, remoteServer()); err != nil {
 		t.Fatalf("create: %v", err)
 	}
+	// mcp_servers.credential_id 有指向 credentials 的外键，先落一行可引用的凭据。
+	if _, err := db.ExecContext(ctx, `
+		INSERT INTO credentials (id, name, type, secret_ref, created_at, updated_at)
+		VALUES ('cred-1', 'weather-key', 'bearer', 'env:WEATHER_KEY', '2026-09-20T10:00:00Z', '2026-09-20T10:00:00Z')`,
+	); err != nil {
+		t.Fatalf("seed credential: %v", err)
+	}
 	advance(time.Minute)
 
-	updated, err := repo.UpdateSpec(ctx, "srv-1", 1, func(spec *server.Spec) error {
-		spec.Runtime.Remote.Endpoint = "http://weather-v2:8080/mcp"
-		spec.Timeouts.Call = 90 * time.Second
-		spec.DesiredState = server.DesiredStopped
-		return nil
+	credID := "cred-1"
+	updated, err := repo.Update(ctx, "srv-1", 1, server.UpdateInput{
+		DisplayName: "Weather v2",
+		Description: "updated",
+		// 空 labels 必须落回 '{}' 并读成非 nil 空 map。
+		Labels: map[string]string{},
+		Runtime: server.RuntimeSpec{
+			Type:   server.RuntimeDocker,
+			Docker: &server.DockerSpec{Image: "weather:2", Port: 8080},
+		},
+		CredentialID: &credID,
+		Timeouts:     server.TimeoutSpec{Connect: 2 * time.Second, List: 3 * time.Second, Call: 4 * time.Second},
+		Limits:       server.LimitSpec{MaxInFlight: 8},
 	})
 	if err != nil {
-		t.Fatalf("update spec: %v", err)
+		t.Fatalf("update: %v", err)
 	}
 
 	if updated.Revision != 2 {
@@ -162,83 +185,136 @@ func TestServerRepositoryUpdateSpec(t *testing.T) {
 	if err != nil {
 		t.Fatalf("get by id: %v", err)
 	}
+
+	// Update 是全量替换：元数据、runtime、凭据、超时、限流都被输入覆盖。
+	if got.DisplayName != "Weather v2" {
+		t.Errorf("DisplayName = %q, want %q", got.DisplayName, "Weather v2")
+	}
+	if got.Description != "updated" {
+		t.Errorf("Description = %q, want %q", got.Description, "updated")
+	}
+	if got.Labels == nil || len(got.Labels) != 0 {
+		t.Errorf("Labels = %#v, want non-nil empty map", got.Labels)
+	}
+	if got.Spec.Runtime.Type != server.RuntimeDocker {
+		t.Errorf("Runtime.Type = %q, want %q", got.Spec.Runtime.Type, server.RuntimeDocker)
+	}
+	if got.Spec.Runtime.Docker == nil || got.Spec.Runtime.Docker.Image != "weather:2" {
+		t.Errorf("Runtime.Docker = %+v, want image weather:2", got.Spec.Runtime.Docker)
+	}
+	if got.Spec.CredentialID == nil || *got.Spec.CredentialID != "cred-1" {
+		t.Errorf("CredentialID = %v, want cred-1", got.Spec.CredentialID)
+	}
+	wantTimeouts := server.TimeoutSpec{Connect: 2 * time.Second, List: 3 * time.Second, Call: 4 * time.Second}
+	if got.Spec.Timeouts != wantTimeouts {
+		t.Errorf("Timeouts = %+v, want %+v", got.Spec.Timeouts, wantTimeouts)
+	}
+	if got.Spec.Limits.MaxInFlight != 8 {
+		t.Errorf("MaxInFlight = %d, want 8", got.Spec.Limits.MaxInFlight)
+	}
 	if got.Revision != 2 {
 		t.Errorf("persisted Revision = %d, want 2", got.Revision)
 	}
-	if got.Spec.Runtime.Remote.Endpoint != "http://weather-v2:8080/mcp" {
-		t.Errorf("persisted Endpoint = %q, want %q", got.Spec.Runtime.Remote.Endpoint, "http://weather-v2:8080/mcp")
+	if !got.UpdatedAt.Equal(t0.Add(time.Minute)) {
+		t.Errorf("persisted UpdatedAt = %v, want %v", got.UpdatedAt, t0.Add(time.Minute))
 	}
-	if got.Spec.Timeouts.Call != 90*time.Second {
-		t.Errorf("persisted Call timeout = %v, want 90s", got.Spec.Timeouts.Call)
+
+	// transport 与 desired_state 不属于 Update 的可变集合，必须保持原值。
+	if got.Spec.Transport != server.TransportStreamableHTTP {
+		t.Errorf("Transport = %q, want unchanged %q", got.Spec.Transport, server.TransportStreamableHTTP)
 	}
-	if got.Spec.DesiredState != server.DesiredStopped {
-		t.Errorf("persisted DesiredState = %q, want %q", got.Spec.DesiredState, server.DesiredStopped)
+	if got.Spec.DesiredState != server.DesiredRunning {
+		t.Errorf("DesiredState = %q, want unchanged %q", got.Spec.DesiredState, server.DesiredRunning)
 	}
-	if !reflect.DeepEqual(got.Spec, updated.Spec) {
-		t.Errorf("returned Spec = %+v, persisted Spec = %+v", updated.Spec, got.Spec)
+	if !reflect.DeepEqual(got, updated) {
+		t.Errorf("returned server = %+v, persisted = %+v", updated, got)
 	}
 }
 
-func TestServerRepositoryUpdateSpecStaleRevision(t *testing.T) {
+func TestServerRepositoryUpdateStaleRevision(t *testing.T) {
 	repo, ctx := newTestRepo(t)
 	if err := repo.Create(ctx, remoteServer()); err != nil {
 		t.Fatalf("create: %v", err)
 	}
 
-	called := false
-	_, err := repo.UpdateSpec(ctx, "srv-1", 7, func(spec *server.Spec) error {
-		called = true
-		spec.Runtime.Remote.Endpoint = "http://stale:8080/mcp"
-		return nil
-	})
-	if !errors.Is(err, server.ErrConflict) {
-		t.Fatalf("UpdateSpec err = %v, want ErrConflict", err)
-	}
-	if called {
-		t.Error("mutate was called despite revision mismatch")
-	}
-
-	got, err := repo.GetByID(ctx, "srv-1")
+	before, err := repo.GetByID(ctx, "srv-1")
 	if err != nil {
 		t.Fatalf("get by id: %v", err)
 	}
-	if got.Revision != 1 || got.Spec.Runtime.Remote.Endpoint != "http://weather:8080/mcp" {
-		t.Errorf("server changed after conflict: revision=%d endpoint=%q",
-			got.Revision, got.Spec.Runtime.Remote.Endpoint)
-	}
-}
 
-func TestServerRepositoryUpdateSpecMissing(t *testing.T) {
-	repo, ctx := newTestRepo(t)
-
-	_, err := repo.UpdateSpec(ctx, "no-such-id", 1, func(*server.Spec) error { return nil })
-	if !errors.Is(err, server.ErrConflict) {
-		t.Fatalf("UpdateSpec err = %v, want ErrConflict", err)
-	}
-}
-
-func TestServerRepositoryUpdateSpecMutateError(t *testing.T) {
-	repo, ctx := newTestRepo(t)
-	if err := repo.Create(ctx, remoteServer()); err != nil {
-		t.Fatalf("create: %v", err)
-	}
-
-	errRejected := errors.New("rejected by caller")
-	_, err := repo.UpdateSpec(ctx, "srv-1", 1, func(spec *server.Spec) error {
-		spec.Timeouts.Call = 90 * time.Second
-		return errRejected
+	_, err = repo.Update(ctx, "srv-1", 7, server.UpdateInput{
+		DisplayName: "should not apply",
+		Runtime: server.RuntimeSpec{
+			Type:   server.RuntimeRemote,
+			Remote: &server.RemoteSpec{Endpoint: "http://stale:8080/mcp"},
+		},
+		Timeouts: server.TimeoutSpec{Connect: time.Second, List: time.Second, Call: time.Second},
+		Limits:   server.LimitSpec{MaxInFlight: 4},
 	})
-	if !errors.Is(err, errRejected) {
-		t.Fatalf("UpdateSpec err = %v, want %v", err, errRejected)
+	if !errors.Is(err, server.ErrConflict) {
+		t.Fatalf("Update err = %v, want ErrConflict", err)
 	}
 
-	got, err := repo.GetByID(ctx, "srv-1")
+	after, err := repo.GetByID(ctx, "srv-1")
 	if err != nil {
 		t.Fatalf("get by id: %v", err)
 	}
-	if got.Revision != 1 || got.Spec.Timeouts.Call != 60*time.Second {
-		t.Errorf("server changed after mutate error: revision=%d call=%v",
-			got.Revision, got.Spec.Timeouts.Call)
+	// 乐观锁失败必须整行不变：revision、时间戳、可变态都不能被触碰。
+	if !reflect.DeepEqual(before, after) {
+		t.Errorf("row changed after conflict:\nbefore = %+v\nafter  = %+v", before, after)
+	}
+}
+
+func TestServerRepositoryUpdateMissing(t *testing.T) {
+	repo, ctx := newTestRepo(t)
+
+	// 契约：目标行不存在的表现与 revision 过期一致，都是 ErrConflict。
+	_, err := repo.Update(ctx, "no-such-id", 1, server.UpdateInput{
+		Runtime: server.RuntimeSpec{
+			Type:   server.RuntimeRemote,
+			Remote: &server.RemoteSpec{Endpoint: "http://ghost:8080/mcp"},
+		},
+		Timeouts: server.TimeoutSpec{Connect: time.Second, List: time.Second, Call: time.Second},
+		Limits:   server.LimitSpec{MaxInFlight: 4},
+	})
+	if !errors.Is(err, server.ErrConflict) {
+		t.Fatalf("Update err = %v, want ErrConflict", err)
+	}
+}
+
+func TestServerRepositoryList(t *testing.T) {
+	repo, ctx := newTestRepo(t)
+
+	// 乱序插入、横跨两个 namespace，且含 disabled 行：List 返回全部
+	// （不按 enabled 过滤），并按 namespace、name 排序。
+	mk := func(id, namespace, name string, enabled bool) server.Server {
+		s := remoteServer()
+		s.ID, s.Namespace, s.Name, s.Enabled = server.ID(id), namespace, name, enabled
+		return s
+	}
+	for _, s := range []server.Server{
+		mk("srv-3", "zeta", "alpha", true),
+		mk("srv-1", "alpha", "beta", true),
+		mk("srv-4", "zeta", "zulu", false),
+		mk("srv-2", "alpha", "alpha", false),
+	} {
+		if err := repo.Create(ctx, s); err != nil {
+			t.Fatalf("create %s: %v", s.ID, err)
+		}
+	}
+
+	got, err := repo.List(ctx)
+	if err != nil {
+		t.Fatalf("list: %v", err)
+	}
+	want := []string{"alpha/alpha", "alpha/beta", "zeta/alpha", "zeta/zulu"}
+	if len(got) != len(want) {
+		t.Fatalf("List len = %d, want %d", len(got), len(want))
+	}
+	for i, w := range want {
+		if id := got[i].Namespace + "/" + got[i].Name; id != w {
+			t.Errorf("List[%d] = %s, want %s", i, id, w)
+		}
 	}
 }
 
@@ -350,7 +426,8 @@ func TestServerRepositorySetEnabled(t *testing.T) {
 		t.Fatalf("create: %v", err)
 	}
 
-	if err := repo.SetEnabled(ctx, "srv-1", false); err != nil {
+	disabled, err := repo.SetEnabled(ctx, "srv-1", false)
+	if err != nil {
 		t.Fatalf("disable: %v", err)
 	}
 	got, err := repo.GetByID(ctx, "srv-1")
@@ -360,6 +437,13 @@ func TestServerRepositorySetEnabled(t *testing.T) {
 	if got.Enabled {
 		t.Error("Enabled = true after SetEnabled(false)")
 	}
+	// 返回的快照必须与随后 GET 一致；enabled 是运行意图，不递增 revision。
+	if !reflect.DeepEqual(disabled, got) {
+		t.Errorf("SetEnabled snapshot = %+v, want %+v", disabled, got)
+	}
+	if got.Revision != 1 {
+		t.Errorf("Revision = %d, want 1 (enabled must not bump revision)", got.Revision)
+	}
 	listed, err := repo.ListEnabled(ctx)
 	if err != nil {
 		t.Fatalf("list enabled: %v", err)
@@ -368,7 +452,7 @@ func TestServerRepositorySetEnabled(t *testing.T) {
 		t.Errorf("ListEnabled len = %d after disable, want 0", len(listed))
 	}
 
-	if err := repo.SetEnabled(ctx, "srv-1", true); err != nil {
+	if _, err := repo.SetEnabled(ctx, "srv-1", true); err != nil {
 		t.Fatalf("enable: %v", err)
 	}
 	listed, err = repo.ListEnabled(ctx)
@@ -380,11 +464,85 @@ func TestServerRepositorySetEnabled(t *testing.T) {
 	}
 }
 
+func TestServerRepositorySetDesiredState(t *testing.T) {
+	repo, ctx := newTestRepo(t)
+	if err := repo.Create(ctx, remoteServer()); err != nil {
+		t.Fatalf("create: %v", err)
+	}
+
+	stopped, err := repo.SetDesiredState(ctx, "srv-1", server.DesiredStopped)
+	if err != nil {
+		t.Fatalf("set desired state: %v", err)
+	}
+	got, err := repo.GetByID(ctx, "srv-1")
+	if err != nil {
+		t.Fatalf("get by id: %v", err)
+	}
+	if got.Spec.DesiredState != server.DesiredStopped {
+		t.Errorf("DesiredState = %q, want %q", got.Spec.DesiredState, server.DesiredStopped)
+	}
+	// 返回的快照必须与随后 GET 一致；desiredState 是运行意图，不递增 revision。
+	if !reflect.DeepEqual(stopped, got) {
+		t.Errorf("SetDesiredState snapshot = %+v, want %+v", stopped, got)
+	}
+	if got.Revision != 1 {
+		t.Errorf("Revision = %d, want 1 (desiredState must not bump revision)", got.Revision)
+	}
+}
+
 func TestServerRepositorySetEnabledMissing(t *testing.T) {
 	repo, ctx := newTestRepo(t)
 
-	if err := repo.SetEnabled(ctx, "no-such-id", false); !errors.Is(err, server.ErrNotFound) {
+	if _, err := repo.SetEnabled(ctx, "no-such-id", false); !errors.Is(err, server.ErrNotFound) {
 		t.Fatalf("SetEnabled err = %v, want ErrNotFound", err)
+	}
+}
+
+// 两个运行意图写路径都属于"调用方发起的资产变更"：刷新 UpdatedAt，但绝不递增 Revision。
+// 与 UpdateStatus（系统心跳）相反——那里的用例断言 UpdatedAt 保持不变。
+func TestServerRepositoryRuntimeIntentRefreshesUpdatedAt(t *testing.T) {
+	repo, ctx := newTestRepo(t)
+	t0 := time.Date(2026, 9, 20, 10, 0, 0, 0, time.UTC)
+	now, advance := fixedClock(t0)
+	repo.WithClock(now)
+
+	if err := repo.Create(ctx, remoteServer()); err != nil {
+		t.Fatalf("create: %v", err)
+	}
+
+	advance(time.Minute)
+	disabled, err := repo.SetEnabled(ctx, "srv-1", false)
+	if err != nil {
+		t.Fatalf("disable: %v", err)
+	}
+	if !disabled.UpdatedAt.Equal(t0.Add(time.Minute)) {
+		t.Errorf("UpdatedAt after SetEnabled = %v, want %v", disabled.UpdatedAt, t0.Add(time.Minute))
+	}
+	if disabled.Revision != 1 {
+		t.Errorf("Revision after SetEnabled = %d, want 1", disabled.Revision)
+	}
+
+	advance(time.Minute)
+	stopped, err := repo.SetDesiredState(ctx, "srv-1", server.DesiredStopped)
+	if err != nil {
+		t.Fatalf("set desired state: %v", err)
+	}
+	if !stopped.UpdatedAt.Equal(t0.Add(2 * time.Minute)) {
+		t.Errorf("UpdatedAt after SetDesiredState = %v, want %v", stopped.UpdatedAt, t0.Add(2*time.Minute))
+	}
+	if stopped.Revision != 1 {
+		t.Errorf("Revision after SetDesiredState = %d, want 1", stopped.Revision)
+	}
+	if !stopped.CreatedAt.Equal(t0) {
+		t.Errorf("CreatedAt = %v, want %v", stopped.CreatedAt, t0)
+	}
+}
+
+func TestServerRepositorySetDesiredStateMissing(t *testing.T) {
+	repo, ctx := newTestRepo(t)
+
+	if _, err := repo.SetDesiredState(ctx, "no-such-id", server.DesiredStopped); !errors.Is(err, server.ErrNotFound) {
+		t.Fatalf("SetDesiredState err = %v, want ErrNotFound", err)
 	}
 }
 

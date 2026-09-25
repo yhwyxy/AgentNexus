@@ -10,14 +10,16 @@ import (
 )
 
 // Options 是 HTTP 层路由装配的依赖。Registry 之外的依赖均可选：
-// Refresher 为 nil 时不注册动作路由，MCP 为 nil 时不挂载 /mcp，
-// Metrics 为 nil 时不注册 /metrics。
+// Refresher 与 Lifecycle 同时为 nil 时不注册动作路由（动作路径退化为 405），
+// 其中 Lifecycle 为 nil 时 enable/disable/start/stop/restart 不可分发（404 unknown action）；
+// MCP 为 nil 时不挂载 /mcp，Metrics 为 nil 时不注册 /metrics。
 // Authenticator 为 nil 时失败关闭（所有请求 403），生产装配永远传入真实 Authorizer。
 // Auditor 为 nil 时不写管理动作的审计事件（测试用），生产装配永远传入真实 Recorder。
 // RequestMetrics 为 nil 时不采集请求指标。
 type Options struct {
 	Registry       ServerRegistry
 	Refresher      ServerRefresher
+	Lifecycle      ServerLifecycle
 	MCP            http.Handler
 	Metrics        http.Handler
 	Authenticator  Authenticator
@@ -40,6 +42,7 @@ func NewHandler(opts Options) http.Handler {
 	servers := &serverHandler{
 		registry:  opts.Registry,
 		refresher: opts.Refresher,
+		lifecycle: opts.Lifecycle,
 		auditor:   opts.Auditor,
 		logger:    logger,
 	}
@@ -54,11 +57,15 @@ func NewHandler(opts Options) http.Handler {
 	}
 	register("GET /health/live", http.HandlerFunc(handleLive))
 	register("GET /health/ready", http.HandlerFunc(handleReady))
+	register("GET "+serverRoute, http.HandlerFunc(servers.list))
 	register("POST "+serverRoute, http.HandlerFunc(servers.register))
 	register("GET "+serverRoute+"/{id}", http.HandlerFunc(servers.get))
-	if opts.Refresher != nil {
+	register("PUT "+serverRoute+"/{id}", http.HandlerFunc(servers.update))
+	if opts.Refresher != nil || opts.Lifecycle != nil {
 		// net/http 的通配段必须独占一段（"{id}:refresh-tools" 非法），
 		// 因此动作路由用 {rest...} 承接，在 handler 内解析 "<id>:<action>"。
+		// 只要有一个动作依赖装配就注册：另一个依赖缺失时由 handler 判为未知动作（404），
+		// 而不是让路径整体退化成 405。
 		register("POST "+serverRoute+"/{rest...}", http.HandlerFunc(servers.action))
 	}
 	if opts.MCP != nil {
