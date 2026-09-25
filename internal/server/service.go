@@ -20,6 +20,11 @@ const (
 	defaultListTimeout    = 10 * time.Second
 	defaultCallTimeout    = 60 * time.Second
 	defaultMaxInFlight    = 16
+
+	// Docker 运行时的 v0.1 冻结默认值；区间校验在 Validate(validation.go)。
+	defaultDockerMemoryBytes  = 256 << 20 // 256 MiB
+	defaultDockerCPUs         = 1.0
+	defaultDockerEndpointPath = "/mcp"
 )
 
 // RegisterInput 是 Service.Register 的输入。零值字段按冻结默认值填充；
@@ -42,9 +47,10 @@ type RegisterInput struct {
 // Service 是 MCP Server 注册的应用服务。它只依赖 Repository 接口，
 // 不接触 SQL、MCP SDK、HTTP 或 Docker。
 type Service struct {
-	repo  Repository
-	newID func() string
-	now   func() time.Time
+	repo   Repository
+	policy SpecPolicy
+	newID  func() string
+	now    func() time.Time
 }
 
 func NewService(repo Repository) *Service {
@@ -71,11 +77,37 @@ func (s *Service) Register(ctx context.Context, in RegisterInput) (Server, error
 		return Server{}, fmt.Errorf("%w: %w", ErrInvalid, err)
 	}
 
+	// 宿主机资源策略(挂载允许清单、环境变量形态)只在配置里存在,
+	// 因此单独注入;违规与形状错误同样归类为 ErrInvalid(HTTP 400)。
+	if err := s.checkPolicy(srv.Spec); err != nil {
+		return Server{}, fmt.Errorf("%w: %w", ErrInvalid, err)
+	}
+
 	if err := s.repo.Create(ctx, srv); err != nil {
 		return Server{}, fmt.Errorf("create server: %w", err)
 	}
 
 	return srv, nil
+}
+
+// SpecPolicy 是宿主机资源访问策略的消费方接口:由配置构造(见
+// internal/runtime/hostaccess),在注册时判定 Docker 运行时的挂载与
+// 环境变量是否被允许。实现在 Ensure 期还会再判一次。
+type SpecPolicy interface {
+	CheckDocker(DockerSpec) error
+}
+
+// WithPolicy 注入宿主机资源策略;未注入时不做策略判定(保持既有行为)。
+func (s *Service) WithPolicy(policy SpecPolicy) *Service {
+	s.policy = policy
+	return s
+}
+
+func (s *Service) checkPolicy(spec Spec) error {
+	if s.policy == nil || spec.Runtime.Type != RuntimeDocker || spec.Runtime.Docker == nil {
+		return nil
+	}
+	return s.policy.CheckDocker(*spec.Runtime.Docker)
 }
 
 // Get 按 ID 查询 Server；不存在返回 ErrNotFound。
@@ -133,6 +165,17 @@ func (s *Service) newServer(in RegisterInput) Server {
 	}
 	if srv.Spec.DesiredState == "" {
 		srv.Spec.DesiredState = DesiredRunning
+	}
+	if docker := srv.Spec.Runtime.Docker; docker != nil {
+		if docker.MemoryBytes == 0 {
+			docker.MemoryBytes = defaultDockerMemoryBytes
+		}
+		if docker.CPUs == 0 {
+			docker.CPUs = defaultDockerCPUs
+		}
+		if docker.EndpointPath == "" && srv.Spec.Transport == TransportStreamableHTTP {
+			docker.EndpointPath = defaultDockerEndpointPath
+		}
 	}
 
 	return srv

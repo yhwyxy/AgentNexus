@@ -1,0 +1,47 @@
+# 空环境可启动的两服务拓扑:控制面 + 远端(streamable_http) MCP 后端。
+#
+# 故意不挂载 docker socket:容器内 socket 的 uid/gid 映射在 Docker Desktop/OrbStack/
+# Linux 上各不相同,挂进来会让"空环境可启动"不可复现。docker runtime 的真实端到端由
+# scripts/docker-provider-smoke.sh(宿主机直跑 + 本机 daemon)覆盖。
+#
+# 密钥必须由外部提供:
+#   export AGENTNEXUS_SMOKE_KEY=$(openssl rand -hex 16)
+services:
+  demo-mcp:
+    build:
+      context: .
+      dockerfile: Dockerfile.demo-mcp
+    image: agentnexus-demo-mcp:local
+    environment:
+      DEMO_MCP_READ_ROOT: /workspace
+    expose:
+      - "8080"
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8080/health/live"]
+      interval: 2s
+      timeout: 2s
+      retries: 15
+
+  agentnexus:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: agentnexus:local
+    depends_on:
+      demo-mcp:
+        condition: service_healthy
+    ports:
+      - "8080:8080"
+    volumes:
+      - ./configs/compose.yaml:/etc/agentnexus/config.yaml:ro
+      - agentnexus-data:/data
+    environment:
+      AGENTNEXUS_SMOKE_KEY: ${AGENTNEXUS_SMOKE_KEY:?set AGENTNEXUS_SMOKE_KEY before compose up}
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8080/health/ready"]
+      interval: 2s
+      timeout: 2s
+      retries: 30
+
+volumes:
+  agentnexus-data:

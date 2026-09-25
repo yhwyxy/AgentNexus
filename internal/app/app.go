@@ -24,6 +24,8 @@ import (
 	"github.com/yhwyxy/AgentNexus/internal/metrics"
 	"github.com/yhwyxy/AgentNexus/internal/observability"
 	"github.com/yhwyxy/AgentNexus/internal/runtime"
+	"github.com/yhwyxy/AgentNexus/internal/runtime/docker"
+	"github.com/yhwyxy/AgentNexus/internal/runtime/hostaccess"
 	"github.com/yhwyxy/AgentNexus/internal/runtime/process"
 	"github.com/yhwyxy/AgentNexus/internal/runtime/remote"
 	"github.com/yhwyxy/AgentNexus/internal/server"
@@ -65,8 +67,22 @@ func Run(configPath string) error {
 	}
 	logger.Info("database migrations applied", "database_path", cfg.Database.Path)
 
+	// 宿主挂载允许清单在最早的失败点编译:非法的 hostAccess(相对路径、容器根、
+	// 重复条目)直接拒绝启动。空清单合法,但意味着任何宿主机挂载都会被拒绝。
+	policy, err := hostaccess.NewPolicy(
+		toHostAccessEntries(cfg.Security.HostAccess.Mounts),
+		dockerSocketPaths(cfg.Runtime.Docker.Host)...,
+	)
+	if err != nil {
+		return fmt.Errorf("build host access policy: %w", err)
+	}
+	if len(cfg.Security.HostAccess.Mounts) == 0 {
+		logger.Warn("no host access mounts configured; docker backends cannot mount host paths")
+	}
+
 	servers := sqlite.NewServerRepository(db)
-	registry := server.NewService(servers)
+	// 策略在这里注入注册期校验;运行期由 DockerProvider 再判一次(见 §4)。
+	registry := server.NewService(servers).WithPolicy(policy)
 	// 审计只有一条写入路径:所有发射点(HTTP 管理动作、生命周期、Runtime、工具调用)
 	// 共用同一个 Recorder,写入失败只记日志,绝不改变业务结果。
 	recorder := audit.NewRecorder(sqlite.NewAuditRepository(db))
@@ -79,7 +95,18 @@ func Run(configPath string) error {
 	catalog := tool.NewCatalog(toolRepo)
 	clients := mcpclient.NewManager(mcpadapter.NewConnector())
 	defer clients.Close(context.Background())
-	runtimes, err := runtime.NewManager(servers, remote.NewProvider(), process.NewProvider(ctx))
+	// 构造客户端不连接 daemon:daemon 不可用不阻断控制面启动。
+	dockerProvider, err := docker.NewProvider(docker.Options{
+		Host:        cfg.Runtime.Docker.Host,
+		Policy:      policy,
+		ConnectHost: cfg.Runtime.Docker.ConnectHost,
+		PublishHost: cfg.Runtime.Docker.PublishHost,
+		StopGrace:   cfg.Runtime.Docker.StopGrace,
+	})
+	if err != nil {
+		return fmt.Errorf("create docker provider: %w", err)
+	}
+	runtimes, err := runtime.NewManager(servers, remote.NewProvider(), process.NewProvider(ctx), dockerProvider)
 	if err != nil {
 		return fmt.Errorf("create runtime manager: %w", err)
 	}
@@ -164,6 +191,36 @@ func Run(configPath string) error {
 		logger.Info("HTTP server stopped")
 		return nil
 	}
+}
+
+// toHostAccessEntries 把配置形态转成策略形态。access 枚举已在 config.Load 解析,
+// 这里只做布尔映射,校验语义仍然只存在于 hostaccess.NewPolicy 一处。
+func toHostAccessEntries(configured []config.HostMountConfig) []hostaccess.Entry {
+	entries := make([]hostaccess.Entry, 0, len(configured))
+	for _, mount := range configured {
+		entries = append(entries, hostaccess.Entry{
+			Host:       mount.Host,
+			Container:  mount.Container,
+			AllowWrite: mount.Access == config.AccessReadWrite,
+		})
+	}
+	return entries
+}
+
+// dockerSocketPaths 收集需要额外拒绝的 daemon socket 路径:显式配置优先,
+// 其次是标准的 DOCKER_HOST(为空时按平台默认 socket 处理,由 docker 包解析)。
+func dockerSocketPaths(configuredHost string) []string {
+	hosts := []string{configuredHost}
+	if env := os.Getenv("DOCKER_HOST"); env != "" {
+		hosts = append(hosts, env)
+	}
+	paths := make([]string, 0, len(hosts))
+	for _, host := range hosts {
+		if path := docker.SocketPath(host); path != "" {
+			paths = append(paths, path)
+		}
+	}
+	return paths
 }
 
 // toKeyConfigs 只做形态转换：角色字符串的合法性由 auth.NewAuthorizer 判定，

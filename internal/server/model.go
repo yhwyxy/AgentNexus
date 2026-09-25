@@ -84,13 +84,15 @@ type ProcessSpec struct {
 }
 
 type DockerSpec struct {
-	Image       string
-	Command     []string
-	Env         map[string]string
-	Mounts      []Mount
-	NetworkMode string
-	MemoryBytes int64
-	CPUs        float64
+	Image        string
+	Command      []string
+	Env          map[string]string
+	Mounts       []Mount
+	NetworkMode  string
+	MemoryBytes  int64   // 0 表示使用默认值;区间见 Validate
+	CPUs         float64 // 0 表示使用默认值;区间见 Validate
+	Port         int     // streamable_http 专用:容器内 MCP TCP 端口;stdio 必须为 0
+	EndpointPath string  // streamable_http 专用:MCP 路径,默认 /mcp
 }
 
 type Mount struct {

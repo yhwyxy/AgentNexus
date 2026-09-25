@@ -4,9 +4,9 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this is
 
-AgentNexus is a self-hosted "Agent Capability Control Plane" written in Go. v0.1 is an MCP gateway/aggregator: register backend MCP servers (remote streamable HTTP, stdio process, Docker), health-check them, aggregate their `tools/list`, and route `tools/call` through a single `/mcp` endpoint using `serverName.toolName` public names. Implemented so far: config/bootstrap, SQLite storage and migrations, the MCP Server domain model/service/repository, Tool snapshots + catalog + sync (`internal/tool`), the runtime `ProviderManager` with the remote and process providers (`internal/runtime`), the MCP client session manager (`internal/mcpclient`), the MCP SDK adapter (`internal/mcpadapter`), the virtual MCP server + router (`internal/gateway`), and the app wiring/lifecycle/reconciler (`internal/app`: registration-triggered sync, startup replay, periodic sweep, `POST ...:refresh-tools`). Not written yet: the Docker runtime provider, `internal/auth`, `internal/audit`, metrics, and health probing (convergence is driven by registration, refresh, and the sweep - there is no active backend health check yet).
+AgentNexus is a self-hosted "Agent Capability Control Plane" written in Go. v0.1 is an MCP gateway/aggregator: register backend MCP servers (remote streamable HTTP, stdio process, Docker), health-check them, aggregate their `tools/list`, and route `tools/call` through a single `/mcp` endpoint using `serverName.toolName` public names. Implemented so far: config/bootstrap, SQLite storage and migrations, the MCP Server domain model/service/repository, Tool snapshots + catalog + sync (`internal/tool`), the runtime `ProviderManager` with the remote, process, and Docker providers (`internal/runtime`), the host mount allow-list (`internal/runtime/hostaccess`), the MCP client session manager (`internal/mcpclient`), the MCP SDK adapter (`internal/mcpadapter`), the virtual MCP server + router (`internal/gateway`), auth/audit/observability/metrics (`internal/auth`, `internal/audit`, `internal/observability`, `internal/metrics`), and the app wiring/lifecycle/reconciler (`internal/app`: registration-triggered sync, startup replay, periodic sweep, `POST ...:refresh-tools`). Not written yet: health probing and ready-server drift polling (convergence is driven by registration, refresh, and the sweep - there is no active backend health check yet), the management API's update/start/stop/restart actions, and credential resolution/injection.
 
-Module: `github.com/yhwyxy/AgentNexus`, Go 1.27. Dependencies are deliberately few: `modernc.org/sqlite` (pure Go, no cgo), `go.yaml.in/yaml/v3`, the official `github.com/modelcontextprotocol/go-sdk`, plus `github.com/google/uuid` (IDs), `golang.org/x/sync` (singleflight in the catalog cache), and `github.com/prometheus/client_golang` (the `/metrics` registry and `promhttp`). HTTP routing uses `net/http` method patterns (`"GET /health/live"`); tests use only the standard `testing` package.
+Module: `github.com/yhwyxy/AgentNexus`, Go 1.27. Dependencies are deliberately few: `modernc.org/sqlite` (pure Go, no cgo), `go.yaml.in/yaml/v3`, the official `github.com/modelcontextprotocol/go-sdk`, plus `github.com/google/uuid` (IDs), `golang.org/x/sync` (singleflight in the catalog cache), `github.com/prometheus/client_golang` (the `/metrics` registry and `promhttp`), and - imported only by `internal/runtime/docker` - `github.com/moby/moby/client` (Engine API client), `github.com/moby/moby/api` (container/mount types + `stdcopy`) and `github.com/containerd/errdefs` (`IsNotFound`). HTTP routing uses `net/http` method patterns (`"GET /health/live"`); tests use only the standard `testing` package.
 
 ## Commands
 
@@ -31,6 +31,10 @@ AGENTNEXUS_HTTP_ADDRESS=:9000 AGENTNEXUS_DATABASE_PATH=/tmp/an.db go run ./cmd/a
 curl localhost:8080/health/live             # {"status":"ok"}; /health/ready is identical for now
 curl -s -X POST localhost:8080/api/v1/mcp-servers -d '{"name":"weather","transport":"streamable_http","runtime":{"type":"remote","remote":{"endpoint":"http://weather-mcp:8080/mcp"}}}'   # 202 + Location
 curl -s -X POST localhost:8080/api/v1/mcp-servers -d '{"name":"local-add","transport":"stdio","runtime":{"type":"process","process":{"command":"/abs/path/to/mcp-server","args":[],"env":{"K":"V"},"workingDir":"/abs/dir"}}}'   # stdio child; command must be an absolute path
+# docker backend, stdio transport: mounts are checked against security.hostAccess.mounts at registration time
+curl -s -X POST localhost:8080/api/v1/mcp-servers -d '{"name":"boxed-add","transport":"stdio","runtime":{"type":"docker","docker":{"image":"agentnexus-demo-mcp:local","command":["-transport","stdio"],"mounts":[{"source":"/abs/sandbox","target":"/workspace","readOnly":true}]}}}'
+# docker backend, streamable_http transport: `port` is the in-container MCP port, `endpointPath` defaults to /mcp
+curl -s -X POST localhost:8080/api/v1/mcp-servers -d '{"name":"boxed-http","transport":"streamable_http","runtime":{"type":"docker","docker":{"image":"agentnexus-demo-mcp:local","command":["-transport","http","-addr","0.0.0.0:8080","-path","/mcp"],"port":8080,"endpointPath":"/mcp"}}}'
 curl -s localhost:8080/api/v1/mcp-servers/<id>   # 200; 404 for unknown id
 curl -s -X POST localhost:8080/api/v1/mcp-servers/<id>:refresh-tools   # 202; 409 if not enabled/running
 # status.phase converges asynchronously: pending -> starting (runtime up) -> ready (tool snapshot published)
@@ -59,6 +63,24 @@ go run ./examples/phase0-add-server -http :8080   # streamable HTTP; omit -http 
 go run ./examples/phase0-add-client               # connects to localhost:8080/mcp
 ```
 
+Docker packaging and end-to-end smoke:
+
+```bash
+docker build -t agentnexus:local .                                  # control plane (Dockerfile)
+docker build -f Dockerfile.demo-mcp -t agentnexus-demo-mcp:local .  # example backend (cmd/demo-mcp)
+export AGENTNEXUS_SMOKE_KEY=$(openssl rand -hex 16)                 # compose refuses to start without it
+docker compose up -d --build                                        # control plane :8080 + demo-mcp backend
+docker compose down -v
+scripts/compose-e2e.sh                                              # the same topology plus assertions
+scripts/docker-provider-smoke.sh                                    # docker runtime end-to-end
+```
+
+- `Dockerfile` builds a static `CGO_ENABLED=0` binary on `golang:1.27-alpine` and runs it as uid 10001 on `alpine:3.21` with CA certificates and a writable `/data`. `configs/compose.yaml` is the Compose config (mounted at `/etc/agentnexus/config.yaml`, database on the `/data` volume).
+- The Compose topology deliberately does **not** mount the Docker socket (socket uid/gid mapping differs between Docker Desktop, OrbStack, and Linux, which would make "starts in an empty environment" irreproducible), so `runtime.docker` stays at its defaults there and only the `remote` transport is used.
+- `scripts/compose-e2e.sh` = `compose up --build` → wait for `/health/ready` → register `demo-mcp` (`streamable_http`, `http://demo-mcp:8080/mcp`) → wait for `ready` → `initialize` + `notifications/initialized` + `tools/list` + `tools/call demo-mcp.demo.echo` via `/mcp` → `compose down -v`; any failed assertion is a non-zero exit.
+- `scripts/docker-provider-smoke.sh` runs the binary on the host against the local daemon and asserts the Docker provider contract: a `stdio` backend with a read-only bind mount returns the mounted file's content through `demo.readfile`, a `streamable_http` backend with `port: 8080` answers `demo.echo`, an out-of-allow-list mount and a mount target outside the allowed container root are rejected with 400 `invalid_argument`, `SIGKILL` + restart adopts the existing container (same container ID), and `SIGTERM` reclaims every `agentnexus-*` container. Both scripts source `scripts/smoke-lib.sh` (curl/awk only, no jq/python).
+- `cmd/demo-mcp` is the deterministic example backend used by both scripts: `-transport http|stdio`, `-addr`, `-path`, logs to stderr (stdout belongs to the MCP protocol in stdio mode). It registers `demo.echo`, `demo.fail`, and `demo.readfile`, which reads files only below `DEMO_MCP_READ_ROOT` (default `/workspace`) and re-checks after `EvalSymlinks`, so "the bind mount really works" becomes an assertable fact. It carries its own copy of the fixture tool set instead of importing `internal/testsupport/fakemcp`, so test-support code never ships in a product binary (see the deviation note in the Docker design spec).
+
 For end-to-end work prefer `internal/testsupport/fakemcp`: a real in-process MCP server exposing `demo.echo`/`demo.fail` over streamable HTTP. Integration tests register it as a backend (`fakemcp.New()`, `fake.HTTP.URL`) and then drive the real HTTP/MCP surface.
 
 ## Architecture
@@ -70,7 +92,7 @@ edge (HTTP / MCP handlers) → application service → domain interfaces → ada
 ```
 
 - `internal/server` is the domain layer. It must not import `database/sql`, the MCP SDK, `net/http`, or Docker types. Its `Repository` interface is shaped by domain needs; `internal/storage/sqlite` is an adapter implementing it.
-- The MCP Go SDK is only imported by `internal/mcpadapter` (plus tests). Domain and service code never see SDK types.
+- MCP Go SDK only imported by `internal/mcpadapter` (plus tests). Domain and service code never see SDK types; the moby Engine client (`github.com/moby/moby/client`, `.../api`) only by `internal/runtime/docker`, and `internal/runtime/hostaccess` depends only on `internal/server` types. Nothing outside those two packages sees Docker types.
 - Gateway/router code (`internal/gateway`, `internal/tool`) must not execute SQL. Runtime providers (`internal/runtime/{remote,process,docker}`) must not decide public tool names.
 - The database stores configuration and observed status only. Never persist live connections, MCP sessions, or process handles.
 
@@ -79,13 +101,21 @@ edge (HTTP / MCP handlers) → application service → domain interfaces → ada
 `cmd/agentnexus/main.go` -> `app.Run`:
 
 ```
-config.Load -> JSON slog logger -> sqlite.Open -> sqlite.Migrate(ctx, db, migrations.FS)
-  -> sqlite.NewServerRepository / sqlite.NewToolRepository
-  -> server.NewService (registry)
-  -> runtime.NewManager(servers, remote.NewProvider(), process.NewProvider(ctx))
+config.Load -> JSON slog logger -> auth.NewAuthorizer(keys, auth.DefaultPolicy())
+  -> sqlite.Open -> sqlite.Migrate(ctx, db, migrations.FS)
+  -> sqlite.NewServerRepository / sqlite.NewToolRepository / sqlite.NewAuditRepository
+  -> hostaccess.NewPolicy(cfg.Security.HostAccess.Mounts, docker socket paths)
+     # compiled at the earliest failure point: a bad allow-list (relative path, host root,
+     # duplicate host) refuses to start; an empty list is legal but blocks every host mount
+  -> server.NewService (registry).WithPolicy(policy)   # policy also runs at Ensure time
+  -> audit.NewRecorder + observability.NewAuditObserver + metrics.New
+  -> runtime.NewManager(servers, remote.NewProvider(), process.NewProvider(ctx),
+                        docker.NewProvider(docker.Options{Host, Policy, ConnectHost, PublishHost, StopGrace}))
      # ctx 是 NotifyContext。正常退出走分阶段关闭(defer runtimes.Close -> Provider.Close,
-     # 按进程组 SIGTERM,宽限后 SIGKILL);ctx 取消只是兜底(exec 默认 Cancel 只 SIGKILL 直接子进程)。
+     # 进程组 SIGTERM 宽限后 SIGKILL;docker 容器 Stop+Remove);
+     # ctx 取消只是兜底(exec 默认 Cancel 只 SIGKILL 直接子进程)。
      # 因为 defer 后进先出,runtimes.Close 先于 clients.Close,stop() 最后。
+     # docker.NewProvider only parses the host locally: an unreachable daemon never blocks startup.
   -> mcpclient.NewManager(mcpadapter.NewConnector())
   -> tool.NewCatalog(toolRepo) + tool.NewSyncService(servers, runtimes, clients, toolRepo, catalog)
   -> gateway.NewToolCaller + gateway.NewVirtualServer -> mcpserver.NewHandler (SDK adapter)
@@ -116,6 +146,7 @@ Registry, startup replay, periodic sweep, and `:refresh-tools` all feed the same
 
 - `Server` = envelope fields + `Spec` (desired config) + `Status` (observed state). `Server.Revision` is the config version; `Status.ObservedRevision` is what the runtime has applied, and a mismatch means a reconcile is needed. `Spec.DesiredState` (running/stopped) and `Status.Phase` (pending/starting/ready/degraded/stopped/failed) are different things; do not conflate them.
 - `RuntimeSpec` is a tagged union: `Type` plus exactly one non-nil payload (`Remote`, `Process`, `Docker`). Transport/runtime matrix: `streamable_http` → remote or docker; `stdio` → process or docker.
+- `DockerSpec` rules: `image` is a single non-empty reference (no whitespace); every `command` element must be non-empty; `env` keys must be valid env names; mount `source`/`target` must be absolute and neither may be the host/container root; `networkMode` is `""`/`none`/`bridge` only; `memoryBytes`/`cpus` are 0 (= default) or inside the frozen ranges, defaulting to 256 MiB / 1.0; `port` is required in 1-65535 for `streamable_http` (and forbidden for `stdio`, as is `endpointPath`), `endpointPath` defaults to `/mcp`, and publishing is rejected with `networkMode: none`. Host-mount authorization is not a domain rule: `Service.WithPolicy(SpecPolicy)` injects the check, `checkPolicy` runs it only for docker specs, and `nil` policy (wiring bug) must be treated as unchanged behaviour, so `internal/server` stays free of filesystem/Docker knowledge.
 - `Validate()` only checks and never mutates. Defaulting (namespace `default`, timeouts 5s/10s/60s, maxInFlight 16, enabled true, desired state running) happens once, in `Service.Register` in the same package, which then assigns the ID and timestamps, validates, and persists through the `Repository` interface. Validation failures wrap `ErrInvalid`; repository errors pass through unchanged. Rules: namespace/name match `^[a-z][a-z0-9-]{0,62}$` and are immutable after registration (rename = new server); remote endpoints are absolute http/https URLs with a host and no userinfo; process commands are absolute paths with args passed as `[]string` to `exec.CommandContext`, never through a shell; secrets go through `CredentialID`, never into headers, env, or URLs.
 - `Repository` sentinel errors: `ErrNotFound`, `ErrAlreadyExists`, `ErrConflict` (optimistic-lock failure when `UpdateSpec` is called with a stale `expectedRevision`), and `ErrNotRunnable` (the server is disabled or `desiredState=stopped`, so runtime work like a tool refresh is meaningless). `Server.Runnable()` is the single definition of that predicate; the SQLite adapter's `ListEnabled` is the repository-side listing the reconciler uses.
 - `Status.Phase` has two writers, per the detailed design §3.4 state machine: `ProviderManager` records `ObservedRevision`/`LastSuccessAt` and moves the phase to `starting` (or `degraded` on runtime failure) but never claims `ready`; `tool.SyncService` writes `ready` only after the snapshot is published (or confirmed unchanged), and writes `degraded` + `consecutive_failures+1` when a refresh fails, leaving the previous `active` snapshot readable. Never write `ready` before the catalog is reloaded - `ready` means "runtime applied the current revision AND the tool catalog is published". `Status.CreateInput()` is the shared status -> `CreateStatusInput` conversion both writers use.
@@ -170,9 +201,13 @@ Registry, startup replay, periodic sweep, and `:refresh-tools` all feed the same
 
 - A `Provider` only starts/stops/inspects an instance. `Manager` (`EnsureReady`, `Stop`, `Reconcile`) owns per-server mutual exclusion (`keyedLocker`), the in-memory instance cache, and `server_status` convergence. Instances are never persisted (the database keeps configuration and observed status only). `(*ProviderManager).Close` stops every active instance and then calls the provider's `Releaser` (declared as `defer` in `app.Run` after `lifecycle` so it runs before `clients.Close`).
 - Provider errors are sanitized into a fixed message (`runtime ensure failed`) before being stored, so endpoints/credentials never reach `server_status`; the original error is still returned to the caller.
-- `internal/runtime/remote` speaks streamable HTTP; `internal/runtime/process` runs local stdio children. `gateway` (call path) and `tool` (refresh path) share one `Manager`, so both reuse the same instance per server.
+- `internal/runtime/remote` speaks streamable HTTP; `internal/runtime/process` runs local stdio children; `internal/runtime/docker` runs stdio children inside containers. `gateway` (call path) and `tool` (refresh path) share one `Manager`, so both reuse the same instance per server.
 - Process semantics: the provider owns the child (`exec.CommandContext` with the application ctx, `Setpgid` so `Stop` signals the whole group, no shell), the pipes (stdin/stdout) and stderr as a bounded ring buffer surfaced by `Logs` (snapshot semantics; `Follow` is rejected until implemented). MCP owns stdin/stdout, so child logs must go to stderr. Sessions borrow `runtime.Streams{Stdin,Stdout}` wrappers whose `Close` only marks "this connection ended" - it never closes the child's fds. A closed stream (or an exited child) makes `Inspect` fail with `ErrInstanceUnavailable`, which is the manager's reap trigger: `Stop` (kill) then `Ensure` (new pid). Instance IDs embed the pid, so a restarted backend gets new session-cache keys.
 - `Inspect` returning an error is the *only* way the manager learns an instance is gone; never close the fds from the adapter or the gateway.
+- Docker semantics (`internal/runtime/docker`): containers are owned, not adopted blindly - every container carries `agentnexus.server-id` and `agentnexus.revision`, and the name is always `agentnexus-<server id>`. `Ensure` lists containers by the server-id label: a *running* container whose revision label matches is reused as-is; every other labelled container of that server is stopped and removed; a name conflict with an unlabelled leftover (previous crash, manual `docker run --name`) is removed too, so restarting the control plane after `SIGKILL` takes over its own container instead of failing. A missing image is pulled (bounded by the connect timeout). `Cmd`/`Env`/`Mounts`/`Resources`/`PortBindings` come from the spec, and the policy is re-checked at `Ensure` time (registration-time validation is not a substitute for the runtime check).
+- stdio is `AttachStdin/Stdout/Stderr` + `OpenStdin` over the Engine API, demultiplexed with `stdcopy` into a stdout pipe (`internal/runtime/docker/streams.go`); stderr is dropped because the daemon's log driver still holds it for `Logs`. `streamable_http` publishes `port` to `publishHost` (default `127.0.0.1`) and `Ensure` polls `connectHost:port+endpointPath` until it answers, failing with the last probe error on timeout. `ConnectTarget` returns `URL` or `Streams` accordingly, so the SDK adapter and the session manager need no docker knowledge.
+- Config keys under `runtime.docker`: `host` (defaults to `DOCKER_HOST`, then the platform socket), `connectHost`, `publishHost` (both default `127.0.0.1`), `stopGrace` (default 5s), plus `logBuffer` in code only (default 64 KiB). `Stop` = `ContainerStop(grace)` + forced `ContainerRemove`, `Close` = the same for every owned container then close the Engine client, and both are idempotent (an unknown or already-forgotten instance returns nil); an unreachable daemon is only discovered at `Ensure`/`Inspect`, never at startup. `Logs` demultiplexes stdout+stderr and supports `Follow` (unlike `process`, which rejects it): non-follow returns the last `logBuffer` bytes, follow hands back a pipe the caller closes.
+- `internal/runtime/hostaccess` compiles `security.hostAccess.mounts` into a `hostaccess.Policy` satisfying `server.SpecPolicy`: entries are resolved (`filepath.Clean` + `EvalSymlinks`) against an absolute allow-list and a fixed deny-list (`/etc`, `/proc`, `/sys`, `/root`, `/var/run/docker.sock`, docker/ssh sockets, plus the configured `runtime.docker.host` paths), and `CheckDocker` also rejects a read-write mount for a read-only entry, a mount outside every container root, and a non-empty `env` in a docker spec whose key name matches the secret pattern (secrets belong in `CredentialID`).
 
 ### Gateway and MCP adapters (`internal/gateway`, `internal/mcpclient`, `internal/mcpadapter`)
 
@@ -189,7 +224,7 @@ Registry, startup replay, periodic sweep, and `:refresh-tools` all feed the same
 
 ### Package layout (from the detailed design)
 
-Done: `internal/tool`, `internal/runtime/{remote,process}`, `internal/mcpclient`, `internal/mcpadapter`, `internal/gateway`, `internal/auth`, `internal/audit`, `internal/observability`, `internal/metrics`. Planned: `internal/runtime/docker`. Place new code in these packages rather than inventing new top-level ones.
+Done: `internal/tool`, `internal/runtime/{remote,process,docker,hostaccess}`, `internal/mcpclient`, `internal/mcpadapter`, `internal/gateway`, `internal/auth`, `internal/audit`, `internal/observability`, `internal/metrics`. Runtime types stop at `remote`/`process`/`docker` (the detailed design's frozen `RuntimeType` set; Kubernetes and multi-node scheduling are post-v0.1 and have no package yet), and the design docs' out-of-scope lists cover the remaining v0.1 gaps (management actions PUT/start/stop/restart, credential resolution/injection, log query API, backend health probing, ready-server drift polling). Place new code in these packages rather than inventing new top-level ones.
 
 ## Conventions
 

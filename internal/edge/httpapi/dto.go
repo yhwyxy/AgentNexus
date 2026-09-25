@@ -48,13 +48,15 @@ type processDTO struct {
 }
 
 type dockerDTO struct {
-	Image       string            `json:"image"`
-	Command     []string          `json:"command,omitempty"`
-	Env         map[string]string `json:"env,omitempty"`
-	Mounts      []mountDTO        `json:"mounts,omitempty"`
-	NetworkMode string            `json:"networkMode,omitempty"`
-	MemoryBytes int64             `json:"memoryBytes,omitempty"`
-	CPUs        float64           `json:"cpus,omitempty"`
+	Image        string            `json:"image"`
+	Command      []string          `json:"command,omitempty"`
+	Env          map[string]string `json:"env,omitempty"`
+	Mounts       []mountDTO        `json:"mounts,omitempty"`
+	NetworkMode  string            `json:"networkMode,omitempty"`
+	MemoryBytes  int64             `json:"memoryBytes,omitempty"`
+	CPUs         float64           `json:"cpus,omitempty"`
+	Port         int               `json:"port,omitempty"`
+	EndpointPath string            `json:"endpointPath,omitempty"`
 }
 
 type mountDTO struct {
@@ -159,13 +161,15 @@ func (d runtimeDTO) toSpec() server.RuntimeSpec {
 			mounts = append(mounts, server.Mount{Source: m.Source, Target: m.Target, ReadOnly: m.ReadOnly})
 		}
 		spec.Docker = &server.DockerSpec{
-			Image:       d.Docker.Image,
-			Command:     d.Docker.Command,
-			Env:         d.Docker.Env,
-			Mounts:      mounts,
-			NetworkMode: d.Docker.NetworkMode,
-			MemoryBytes: d.Docker.MemoryBytes,
-			CPUs:        d.Docker.CPUs,
+			Image:        d.Docker.Image,
+			Command:      d.Docker.Command,
+			Env:          d.Docker.Env,
+			Mounts:       mounts,
+			NetworkMode:  d.Docker.NetworkMode,
+			MemoryBytes:  d.Docker.MemoryBytes,
+			CPUs:         d.Docker.CPUs,
+			Port:         d.Docker.Port,
+			EndpointPath: d.Docker.EndpointPath,
 		}
 	}
 	return spec
@@ -231,13 +235,15 @@ func runtimeFromSpec(spec server.RuntimeSpec) runtimeDTO {
 			mounts = append(mounts, mountDTO{Source: m.Source, Target: m.Target, ReadOnly: m.ReadOnly})
 		}
 		d.Docker = &dockerDTO{
-			Image:       spec.Docker.Image,
-			Command:     spec.Docker.Command,
-			Env:         spec.Docker.Env,
-			Mounts:      mounts,
-			NetworkMode: spec.Docker.NetworkMode,
-			MemoryBytes: spec.Docker.MemoryBytes,
-			CPUs:        spec.Docker.CPUs,
+			Image:        spec.Docker.Image,
+			Command:      spec.Docker.Command,
+			Env:          spec.Docker.Env,
+			Mounts:       mounts,
+			NetworkMode:  spec.Docker.NetworkMode,
+			MemoryBytes:  spec.Docker.MemoryBytes,
+			CPUs:         spec.Docker.CPUs,
+			Port:         spec.Docker.Port,
+			EndpointPath: spec.Docker.EndpointPath,
 		}
 	}
 	return d

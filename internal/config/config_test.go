@@ -154,3 +154,131 @@ func TestLoadRejectsInvalidSecurityAPIKeys(t *testing.T) {
 		})
 	}
 }
+
+// DOCKER_HOST 是 Docker 生态的既有约定：未显式配置时跟随它，YAML 显式配置优先。
+func TestLoadDockerConfig(t *testing.T) {
+	tests := []struct {
+		name            string
+		yaml            string
+		dockerHost      string
+		wantHost        string
+		wantConnectHost string
+		wantPublishHost string
+		wantStopGrace   time.Duration
+	}{
+		{
+			name:            "defaults",
+			wantHost:        "unix:///var/run/docker.sock",
+			wantConnectHost: "127.0.0.1",
+			wantPublishHost: "127.0.0.1",
+			wantStopGrace:   5 * time.Second,
+		},
+		{
+			name:            "docker host environment",
+			dockerHost:      "tcp://orbstack.local:2375",
+			wantHost:        "tcp://orbstack.local:2375",
+			wantConnectHost: "127.0.0.1",
+			wantPublishHost: "127.0.0.1",
+			wantStopGrace:   5 * time.Second,
+		},
+		{
+			name:            "yaml wins over environment",
+			yaml:            "runtime:\n  docker:\n    host: unix:///run/user/501/docker.sock\n",
+			dockerHost:      "tcp://orbstack.local:2375",
+			wantHost:        "unix:///run/user/501/docker.sock",
+			wantConnectHost: "127.0.0.1",
+			wantPublishHost: "127.0.0.1",
+			wantStopGrace:   5 * time.Second,
+		},
+		{
+			name: "full override",
+			yaml: "runtime:\n  docker:\n    host: tcp://dockerd:2375\n    connectHost: host.docker.internal\n" +
+				"    publishHost: 0.0.0.0\n    stopGrace: 12s\n",
+			wantHost:        "tcp://dockerd:2375",
+			wantConnectHost: "host.docker.internal",
+			wantPublishHost: "0.0.0.0",
+			wantStopGrace:   12 * time.Second,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Setenv("DOCKER_HOST", tt.dockerHost)
+
+			cfg, err := config.Load(writeConfig(t, tt.yaml))
+			if err != nil {
+				t.Fatalf("load config: %v", err)
+			}
+			if cfg.Runtime.Docker.Host != tt.wantHost {
+				t.Fatalf("docker host = %q, want %q", cfg.Runtime.Docker.Host, tt.wantHost)
+			}
+			if cfg.Runtime.Docker.ConnectHost != tt.wantConnectHost {
+				t.Fatalf("docker connectHost = %q, want %q", cfg.Runtime.Docker.ConnectHost, tt.wantConnectHost)
+			}
+			if cfg.Runtime.Docker.PublishHost != tt.wantPublishHost {
+				t.Fatalf("docker publishHost = %q, want %q", cfg.Runtime.Docker.PublishHost, tt.wantPublishHost)
+			}
+			if cfg.Runtime.Docker.StopGrace != tt.wantStopGrace {
+				t.Fatalf("docker stopGrace = %s, want %s", cfg.Runtime.Docker.StopGrace, tt.wantStopGrace)
+			}
+		})
+	}
+}
+
+func TestLoadRejectsInvalidDockerConfig(t *testing.T) {
+	tests := []struct {
+		name string
+		yaml string
+	}{
+		{name: "host without scheme", yaml: "runtime:\n  docker:\n    host: /var/run/docker.sock\n"},
+		{name: "unsupported scheme", yaml: "runtime:\n  docker:\n    host: npipe:////./pipe/docker_engine\n"},
+		{name: "unparsable stop grace", yaml: "runtime:\n  docker:\n    stopGrace: soon\n"},
+		{name: "zero stop grace", yaml: "runtime:\n  docker:\n    stopGrace: 0s\n"},
+		{name: "negative stop grace", yaml: "runtime:\n  docker:\n    stopGrace: -3s\n"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Setenv("DOCKER_HOST", "")
+
+			if _, err := config.Load(writeConfig(t, tt.yaml)); err == nil {
+				t.Fatal("Load accepted an invalid runtime.docker configuration")
+			}
+		})
+	}
+}
+
+func TestLoadHostAccessMounts(t *testing.T) {
+	t.Setenv("DOCKER_HOST", "")
+	cfg, err := config.Load(writeConfig(t, "security:\n  hostAccess:\n    mounts:\n"+
+		"      - {host: /Users/dev/sandbox, container: /workspace, access: rw}\n"+
+		"      - {host: /Users/dev/reference, container: /reference}\n"))
+	if err != nil {
+		t.Fatalf("load config: %v", err)
+	}
+
+	want := []config.HostMountConfig{
+		{Host: "/Users/dev/sandbox", Container: "/workspace", Access: config.AccessReadWrite},
+		{Host: "/Users/dev/reference", Container: "/reference", Access: config.AccessReadOnly},
+	}
+	if len(cfg.Security.HostAccess.Mounts) != len(want) {
+		t.Fatalf("mounts = %+v, want %+v", cfg.Security.HostAccess.Mounts, want)
+	}
+	for i, entry := range cfg.Security.HostAccess.Mounts {
+		if entry != want[i] {
+			t.Fatalf("mounts[%d] = %+v, want %+v", i, entry, want[i])
+		}
+	}
+}
+
+func TestLoadRejectsInvalidHostAccessMounts(t *testing.T) {
+	t.Setenv("DOCKER_HOST", "")
+	_, err := config.Load(writeConfig(t, "security:\n  hostAccess:\n    mounts:\n"+
+		"      - {host: /Users/dev/sandbox, container: /workspace, access: write}\n"))
+	if err == nil {
+		t.Fatal("Load accepted an invalid hostAccess access mode")
+	}
+	if !strings.Contains(err.Error(), "security.hostAccess.mounts[0].access") {
+		t.Fatalf("error %q does not point at the offending mount", err)
+	}
+}

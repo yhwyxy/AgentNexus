@@ -1,0 +1,31 @@
+# Compose 冒烟用配置:空环境可直接启动,无需本机 Docker socket。
+# 密钥来自环境变量 AGENTNEXUS_SMOKE_KEY(compose 会以 :? 强制要求),不写进仓库。
+server:
+  httpAddress: ":8080"
+  shutdownTimeout: 15s
+
+# 命名卷挂载点,容器内路径固定。
+database:
+  path: "/data/agentnexus.db"
+
+# 运行态收敛:启动重放后按该间隔重试未收敛的 Server。
+runtime:
+  reconcileInterval: 30s
+  # 本配置默认不挂 docker socket(见 docker-compose.yml 注释):
+  # 这些值是默认值,保留以便需要时在同一份配置上开启 docker runtime。
+  docker:
+    connectHost: 127.0.0.1
+    publishHost: 127.0.0.1
+    stopGrace: 5s
+
+security:
+  apiKeys:
+    - name: compose-smoke
+      role: admin
+      keyEnv: AGENTNEXUS_SMOKE_KEY
+  # 允许清单为空 = 禁止一切宿主机挂载;这里留一条只读示例,便于扩展。
+  hostAccess:
+    mounts:
+      - host: /workspace
+        container: /workspace
+        access: ro

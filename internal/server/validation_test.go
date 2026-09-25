@@ -175,3 +175,189 @@ func TestProcessRuntimeValidate(t *testing.T) {
 		})
 	}
 }
+
+func validDockerServer() Server {
+	srv := validRemoteServer()
+	srv.Spec.Transport = TransportStdio
+	srv.Spec.Runtime = RuntimeSpec{
+		Type: RuntimeDocker,
+		Docker: &DockerSpec{
+			Image:       "ghcr.io/example/fs:1",
+			Command:     []string{"fs", "--root", "/workspace"},
+			Env:         map[string]string{"LOG_LEVEL": "info"},
+			Mounts:      []Mount{{Source: "/srv/sandbox", Target: "/workspace", ReadOnly: true}},
+			NetworkMode: "none",
+			MemoryBytes: 256 << 20,
+			CPUs:        0.5,
+		},
+	}
+	return srv
+}
+
+// Validate 只判形状与区间；挂载是否命中允许清单由 HostAccessPolicy 判定。
+func TestDockerRuntimeValidate(t *testing.T) {
+	tests := []struct {
+		name    string
+		mutate  func(*Server)
+		wantErr bool
+	}{
+		{
+			name: "stdio docker with zero values left to defaults",
+			mutate: func(s *Server) {
+				s.Spec.Runtime.Docker.MemoryBytes = 0
+				s.Spec.Runtime.Docker.CPUs = 0
+			},
+		},
+		{
+			name: "streamable http docker with port and path",
+			mutate: func(s *Server) {
+				s.Spec.Transport = TransportStreamableHTTP
+				s.Spec.Runtime.Docker.NetworkMode = ""
+				s.Spec.Runtime.Docker.Port = 8080
+				s.Spec.Runtime.Docker.EndpointPath = "/mcp"
+			},
+		},
+		{
+			name: "empty image",
+			mutate: func(s *Server) {
+				s.Spec.Runtime.Docker.Image = ""
+			},
+			wantErr: true,
+		},
+		{
+			name: "image with whitespace",
+			mutate: func(s *Server) {
+				s.Spec.Runtime.Docker.Image = "ghcr.io/example/fs:1 --privileged"
+			},
+			wantErr: true,
+		},
+		{
+			name: "empty command argument",
+			mutate: func(s *Server) {
+				s.Spec.Runtime.Docker.Command = []string{"fs", ""}
+			},
+			wantErr: true,
+		},
+		{
+			name: "invalid env key",
+			mutate: func(s *Server) {
+				s.Spec.Runtime.Docker.Env = map[string]string{"LOG-LEVEL": "info"}
+			},
+			wantErr: true,
+		},
+		{
+			name: "relative mount source",
+			mutate: func(s *Server) {
+				s.Spec.Runtime.Docker.Mounts = []Mount{{Source: "srv/sandbox", Target: "/workspace"}}
+			},
+			wantErr: true,
+		},
+		{
+			name: "host root mount",
+			mutate: func(s *Server) {
+				s.Spec.Runtime.Docker.Mounts = []Mount{{Source: "/", Target: "/workspace"}}
+			},
+			wantErr: true,
+		},
+		{
+			name: "container root target",
+			mutate: func(s *Server) {
+				s.Spec.Runtime.Docker.Mounts = []Mount{{Source: "/srv/sandbox", Target: "/"}}
+			},
+			wantErr: true,
+		},
+		{
+			name: "unsupported network mode",
+			mutate: func(s *Server) {
+				s.Spec.Runtime.Docker.NetworkMode = "host"
+			},
+			wantErr: true,
+		},
+		{
+			name: "memory below the lower bound",
+			mutate: func(s *Server) {
+				s.Spec.Runtime.Docker.MemoryBytes = 1 << 20
+			},
+			wantErr: true,
+		},
+		{
+			name: "memory above the upper bound",
+			mutate: func(s *Server) {
+				s.Spec.Runtime.Docker.MemoryBytes = 64 << 30
+			},
+			wantErr: true,
+		},
+		{
+			name: "cpus above the upper bound",
+			mutate: func(s *Server) {
+				s.Spec.Runtime.Docker.CPUs = 16
+			},
+			wantErr: true,
+		},
+		{
+			name: "stdio with container port",
+			mutate: func(s *Server) {
+				s.Spec.Runtime.Docker.Port = 8080
+			},
+			wantErr: true,
+		},
+		{
+			name: "stdio with endpoint path",
+			mutate: func(s *Server) {
+				s.Spec.Runtime.Docker.EndpointPath = "/mcp"
+			},
+			wantErr: true,
+		},
+		{
+			name: "streamable http without port",
+			mutate: func(s *Server) {
+				s.Spec.Transport = TransportStreamableHTTP
+				s.Spec.Runtime.Docker.NetworkMode = ""
+			},
+			wantErr: true,
+		},
+		{
+			name: "streamable http with out of range port",
+			mutate: func(s *Server) {
+				s.Spec.Transport = TransportStreamableHTTP
+				s.Spec.Runtime.Docker.NetworkMode = ""
+				s.Spec.Runtime.Docker.Port = 70000
+			},
+			wantErr: true,
+		},
+		{
+			name: "streamable http with relative endpoint path",
+			mutate: func(s *Server) {
+				s.Spec.Transport = TransportStreamableHTTP
+				s.Spec.Runtime.Docker.NetworkMode = ""
+				s.Spec.Runtime.Docker.Port = 8080
+				s.Spec.Runtime.Docker.EndpointPath = "mcp"
+			},
+			wantErr: true,
+		},
+		{
+			name: "streamable http cannot use network mode none",
+			mutate: func(s *Server) {
+				s.Spec.Transport = TransportStreamableHTTP
+				s.Spec.Runtime.Docker.Port = 8080
+			},
+			wantErr: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			srv := validDockerServer()
+			if tt.mutate != nil {
+				tt.mutate(&srv)
+			}
+			err := srv.Validate()
+			if tt.wantErr && err == nil {
+				t.Fatal("Validate() error = nil, want error")
+			}
+			if !tt.wantErr && err != nil {
+				t.Fatalf("Validate() unexpected error: %v", err)
+			}
+		})
+	}
+}

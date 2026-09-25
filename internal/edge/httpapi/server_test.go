@@ -19,6 +19,7 @@ import (
 
 	"github.com/yhwyxy/AgentNexus/internal/auth"
 	"github.com/yhwyxy/AgentNexus/internal/edge/httpapi"
+	"github.com/yhwyxy/AgentNexus/internal/runtime/hostaccess"
 	"github.com/yhwyxy/AgentNexus/internal/server"
 	"github.com/yhwyxy/AgentNexus/internal/storage/sqlite"
 	"github.com/yhwyxy/AgentNexus/migrations"
@@ -48,6 +49,12 @@ func testAuthorizer(t *testing.T) *auth.Authorizer {
 // 时钟与 ID 固定，使响应 JSON 可与字面量逐字段比对。
 func newTestHandler(t *testing.T) http.Handler {
 	t.Helper()
+	return newTestHandlerWithService(t, nil)
+}
+
+// newTestHandlerWithService 允许用例在注册服上追加装配（例如注入宿主机访问策略）。
+func newTestHandlerWithService(t *testing.T, configure func(*server.Service) *server.Service) http.Handler {
+	t.Helper()
 	ctx := context.Background()
 
 	db, err := sqlite.Open(ctx, filepath.Join(t.TempDir(), "test.db"))
@@ -64,6 +71,9 @@ func newTestHandler(t *testing.T) http.Handler {
 	registry := server.NewService(sqlite.NewServerRepository(db)).
 		WithClock(func() time.Time { return t0 }).
 		WithIDGenerator(func() string { n++; return fmt.Sprintf("srv-%d", n) })
+	if configure != nil {
+		registry = configure(registry)
+	}
 
 	return httpapi.NewHandler(httpapi.Options{
 		Registry:      registry,
@@ -283,6 +293,14 @@ func TestRegisterRuntimeVariantsRoundTrip(t *testing.T) {
 				"env":{"LOG":"info"},"mounts":[{"source":"/srv/data","target":"/w","readOnly":true}],
 				"networkMode":"none","memoryBytes":268435456,"cpus":0.5}}`,
 		},
+		{
+			name: "docker streamable http",
+			body: `{"name":"fs-http","transport":"streamable_http","runtime":{"type":"docker",
+				"docker":{"image":"ghcr.io/example/fs:1","port":8080}}}`,
+			// endpointPath 未提供时按默认 /mcp 落库。
+			wantRuntime: `{"type":"docker","docker":{"image":"ghcr.io/example/fs:1",
+				"memoryBytes":268435456,"cpus":1,"port":8080,"endpointPath":"/mcp"}}`,
+		},
 	}
 
 	for _, tt := range tests {
@@ -307,6 +325,57 @@ func TestRegisterRuntimeVariantsRoundTrip(t *testing.T) {
 				t.Fatalf("decode: %v", err)
 			}
 			assertJSONEqual(t, got.Spec.Runtime, tt.wantRuntime)
+		})
+	}
+}
+
+// 宿主机挂载策略在注册期生效：允许清单外的路径必须得到 400 invalid_argument，
+// 清单内但越权写、越界落地同样被拒绝。
+func TestRegisterAppliesHostAccessPolicy(t *testing.T) {
+	root := t.TempDir()
+	policy, err := hostaccess.NewPolicy([]hostaccess.Entry{
+		{Host: root, Container: "/workspace", AllowWrite: false},
+	})
+	if err != nil {
+		t.Fatalf("build policy: %v", err)
+	}
+	h := newTestHandlerWithService(t, func(s *server.Service) *server.Service {
+		return s.WithPolicy(policy)
+	})
+
+	body := func(name string, mounts []map[string]any) string {
+		encoded, err := json.Marshal(map[string]any{
+			"name": name, "transport": "stdio",
+			"runtime": map[string]any{
+				"type":   "docker",
+				"docker": map[string]any{"image": "ghcr.io/example/fs:1", "mounts": mounts},
+			},
+		})
+		if err != nil {
+			t.Fatalf("encode body: %v", err)
+		}
+		return string(encoded)
+	}
+
+	rec := do(t, h, http.MethodPost, "/api/v1/mcp-servers", body("allowed", []map[string]any{
+		{"source": filepath.Join(root, "data"), "target": "/workspace/data", "readOnly": true},
+	}))
+	if rec.Code != http.StatusAccepted {
+		t.Fatalf("allowed mount status = %d, want 202; body: %s", rec.Code, rec.Body)
+	}
+
+	rejected := map[string][]map[string]any{
+		"outside allowed roots": {{"source": "/srv/elsewhere", "target": "/workspace/data", "readOnly": true}},
+		"write on read only":    {{"source": filepath.Join(root, "data"), "target": "/workspace/data"}},
+		"target outside root":   {{"source": filepath.Join(root, "data"), "target": "/data", "readOnly": true}},
+	}
+	for name, mounts := range rejected {
+		t.Run(name, func(t *testing.T) {
+			rec := do(t, h, http.MethodPost, "/api/v1/mcp-servers", body("denied", mounts))
+			if rec.Code != http.StatusBadRequest {
+				t.Fatalf("status = %d, want 400; body: %s", rec.Code, rec.Body)
+			}
+			assertErrorCode(t, rec, "invalid_argument")
 		})
 	}
 }
