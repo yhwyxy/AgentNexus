@@ -2,12 +2,17 @@ package gateway_test
 
 import (
 	"context"
+	"encoding/json"
+	"io"
+	"net/http"
 	"net/http/httptest"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
+	"github.com/yhwyxy/AgentNexus/internal/auth"
 	"github.com/yhwyxy/AgentNexus/internal/edge/httpapi"
 	"github.com/yhwyxy/AgentNexus/internal/gateway"
 	"github.com/yhwyxy/AgentNexus/internal/mcpadapter"
@@ -70,7 +75,36 @@ func TestStreamableMCPGatewayListsValidatesAndCallsBackend(t *testing.T) {
 		t.Fatal(err)
 	}
 	client := mcp.NewClient(&mcp.Implementation{Name: "gateway-test-client", Version: "1.0.0"}, nil)
-	session, err := client.Connect(ctx, &mcp.StreamableClientTransport{Endpoint: testHTTPServer(t, handler)}, nil)
+	endpoint := testHTTPServer(t, handler) + "/mcp"
+
+	// 拒绝发生在 MCP 协议层之前：无凭证的 /mcp 请求拿到传输层 401 + 错误信封，
+	// 不会进入 JSON-RPC。
+	unauthenticated, err := http.Post(endpoint, "application/json",
+		strings.NewReader(`{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}`))
+	if err != nil {
+		t.Fatalf("unauthenticated /mcp: %v", err)
+	}
+	rawBody, _ := io.ReadAll(unauthenticated.Body)
+	unauthenticated.Body.Close()
+	if unauthenticated.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("unauthenticated /mcp status = %d, want 401; body: %s", unauthenticated.StatusCode, rawBody)
+	}
+	var authError struct {
+		Error struct {
+			Code string `json:"code"`
+		} `json:"error"`
+	}
+	if err := json.Unmarshal(rawBody, &authError); err != nil {
+		t.Fatalf("401 body is not the error envelope: %v; raw: %s", err, rawBody)
+	}
+	if authError.Error.Code != "unauthenticated" {
+		t.Fatalf("error.code = %q, want unauthenticated", authError.Error.Code)
+	}
+
+	session, err := client.Connect(ctx, &mcp.StreamableClientTransport{
+		Endpoint:   endpoint,
+		HTTPClient: &http.Client{Transport: bearerTransport{secret: testAdminSecret}},
+	}, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -123,10 +157,34 @@ func TestStreamableMCPGatewayListsValidatesAndCallsBackend(t *testing.T) {
 	}
 }
 
+// 与生产同一套默认策略，只替换密钥表。
+const testAdminSecret = "gateway-admin-secret"
+
+func testAuthorizer(t *testing.T) *auth.Authorizer {
+	t.Helper()
+	authorizer, err := auth.NewAuthorizer(
+		[]auth.KeyConfig{{Name: "admin", Role: auth.RoleAdmin, Secret: testAdminSecret}},
+		auth.DefaultPolicy(),
+	)
+	if err != nil {
+		t.Fatalf("build test authorizer: %v", err)
+	}
+	return authorizer
+}
+
+// bearerTransport 给每个出站请求补上凭证（HTTP 客户端与 MCP 流式传输共用）。
+type bearerTransport struct{ secret string }
+
+func (t bearerTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	clone := req.Clone(req.Context())
+	clone.Header.Set("Authorization", "Bearer "+t.secret)
+	return http.DefaultTransport.RoundTrip(clone)
+}
+
 func testHTTPServer(t *testing.T, handler *mcpserver.Handler) string {
 	t.Helper()
-	mux := httpapi.NewHandler(httpapi.Options{MCP: handler})
+	mux := httpapi.NewHandler(httpapi.Options{MCP: handler, Authenticator: testAuthorizer(t)})
 	httpServer := httptest.NewServer(mux)
 	t.Cleanup(httpServer.Close)
-	return httpServer.URL + "/mcp"
+	return httpServer.URL
 }

@@ -21,6 +21,21 @@ type Config struct {
 	Server   ServerConfig   `yaml:"server"`
 	Database DatabaseConfig `yaml:"database"`
 	Runtime  RuntimeConfig  `yaml:"runtime"`
+	Security SecurityConfig `yaml:"security"`
+}
+
+// SecurityConfig 描述静态 API Key 认证（详细设计 §13）。空列表合法：服务照常启动，
+// 但除公开探针外全部请求都会被拒绝。
+type SecurityConfig struct {
+	APIKeys []APIKeyConfig `yaml:"apiKeys"`
+}
+
+// APIKeyConfig 是一条已解析的密钥。Role 只在此处保持字符串形态，
+// 语义校验（合法角色、名称/密钥唯一）在 auth.NewAuthorizer 里完成。
+type APIKeyConfig struct {
+	Name   string `yaml:"name"`
+	Role   string `yaml:"role"`
+	Secret string `yaml:"-"`
 }
 
 type ServerConfig struct {
@@ -42,6 +57,20 @@ type rawConfig struct {
 	Server   rawServerConfig   `yaml:"server"`
 	Database rawDatabaseConfig `yaml:"database"`
 	Runtime  rawRuntimeConfig  `yaml:"runtime"`
+	Security rawSecurityConfig `yaml:"security"`
+}
+
+type rawSecurityConfig struct {
+	APIKeys []rawAPIKeyConfig `yaml:"apiKeys"`
+}
+
+// rawAPIKeyConfig 故意带 key/keyEnv 两个字段：互斥校验必须在解析层完成，
+// 因为它们决定 Secret 从哪来（字面量还是环境变量）。
+type rawAPIKeyConfig struct {
+	Name   string `yaml:"name"`
+	Role   string `yaml:"role"`
+	Key    string `yaml:"key"`
+	KeyEnv string `yaml:"keyEnv"`
 }
 
 type rawRuntimeConfig struct {
@@ -135,7 +164,43 @@ func loadYAML(path string, cfg *Config) error {
 		cfg.Runtime.ReconcileInterval = interval
 	}
 
+	keys, err := resolveAPIKeys(raw.Security.APIKeys)
+	if err != nil {
+		return err
+	}
+
+	cfg.Security.APIKeys = keys
+
 	return nil
+}
+
+// resolveAPIKeys 把 key/keyEnv 解析成明文密钥。错误信息只带下标与字段名，
+// 绝不回显密钥值。
+func resolveAPIKeys(raw []rawAPIKeyConfig) ([]APIKeyConfig, error) {
+	keys := make([]APIKeyConfig, 0, len(raw))
+	for i, entry := range raw {
+		key := APIKeyConfig{Name: entry.Name, Role: entry.Role}
+
+		switch {
+		case entry.Key != "" && entry.KeyEnv != "":
+			return nil, fmt.Errorf("security.apiKeys[%d]: key and keyEnv are mutually exclusive", i)
+		case entry.Key != "":
+			key.Secret = entry.Key
+		case entry.KeyEnv != "":
+			secret := os.Getenv(entry.KeyEnv)
+			if secret == "" {
+				return nil, fmt.Errorf("security.apiKeys[%d]: environment variable %q is not set", i, entry.KeyEnv)
+			}
+
+			key.Secret = secret
+		default:
+			return nil, fmt.Errorf("security.apiKeys[%d]: exactly one of key or keyEnv is required", i)
+		}
+
+		keys = append(keys, key)
+	}
+
+	return keys, nil
 }
 
 func loadEnvironment(cfg *Config) error {

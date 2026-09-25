@@ -3,6 +3,7 @@ package httpapi_test
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -16,11 +17,32 @@ import (
 	"testing"
 	"time"
 
+	"github.com/yhwyxy/AgentNexus/internal/auth"
 	"github.com/yhwyxy/AgentNexus/internal/edge/httpapi"
 	"github.com/yhwyxy/AgentNexus/internal/server"
 	"github.com/yhwyxy/AgentNexus/internal/storage/sqlite"
 	"github.com/yhwyxy/AgentNexus/migrations"
 )
+
+// 测试密钥：与 configs 里的示例同形，但值只存在于测试进程内。
+const (
+	testAdminSecret = "test-admin-secret"
+	testAgentSecret = "test-agent-secret"
+)
+
+// testAuthorizer 与生产装配共用同一套默认策略，只替换密钥表，因此这里断言的行为
+// 就是线上策略的行为。
+func testAuthorizer(t *testing.T) *auth.Authorizer {
+	t.Helper()
+	authorizer, err := auth.NewAuthorizer([]auth.KeyConfig{
+		{Name: "test-admin", Role: auth.RoleAdmin, Secret: testAdminSecret},
+		{Name: "test-agent", Role: auth.RoleAgent, Secret: testAgentSecret},
+	}, auth.DefaultPolicy())
+	if err != nil {
+		t.Fatalf("build test authorizer: %v", err)
+	}
+	return authorizer
+}
 
 // newTestHandler 用真实 Service + 真实 SQLite 组装 HTTP handler，
 // 时钟与 ID 固定，使响应 JSON 可与字面量逐字段比对。
@@ -44,16 +66,29 @@ func newTestHandler(t *testing.T) http.Handler {
 		WithIDGenerator(func() string { n++; return fmt.Sprintf("srv-%d", n) })
 
 	return httpapi.NewHandler(httpapi.Options{
-		Registry: registry,
-		Logger:   slog.New(slog.NewTextHandler(io.Discard, nil)),
+		Registry:      registry,
+		Authenticator: testAuthorizer(t),
+		Logger:        slog.New(slog.NewTextHandler(io.Discard, nil)),
 	})
 }
 
+// do 默认以 admin 身份发起请求：注册/查询/动作用例都应当通过认证。
+// 认证相关的断言改用 doRequest 自行决定凭证。
 func do(t *testing.T, h http.Handler, method, path, body string) *httptest.ResponseRecorder {
+	t.Helper()
+	return doRequest(t, h, method, path, body, map[string]string{
+		"Authorization": "Bearer " + testAdminSecret,
+	})
+}
+
+func doRequest(t *testing.T, h http.Handler, method, path, body string, headers map[string]string) *httptest.ResponseRecorder {
 	t.Helper()
 	req := httptest.NewRequest(method, path, strings.NewReader(body))
 	if body != "" {
 		req.Header.Set("Content-Type", "application/json")
+	}
+	for name, value := range headers {
+		req.Header.Set(name, value)
 	}
 	rec := httptest.NewRecorder()
 	h.ServeHTTP(rec, req)
@@ -343,8 +378,9 @@ func (f failingRegistry) Get(context.Context, server.ID) (server.Server, error) 
 func TestUnexpectedErrorIsOpaqueAndLogged(t *testing.T) {
 	var logs bytes.Buffer
 	h := httpapi.NewHandler(httpapi.Options{
-		Registry: failingRegistry{err: errors.New("boom: /var/lib/secret")},
-		Logger:   slog.New(slog.NewTextHandler(&logs, nil)),
+		Registry:      failingRegistry{err: errors.New("boom: /var/lib/secret")},
+		Authenticator: testAuthorizer(t),
+		Logger:        slog.New(slog.NewTextHandler(&logs, nil)),
 	})
 
 	tests := []struct{ method, path, body string }{
@@ -418,18 +454,21 @@ func refreshableServer() server.Server {
 	}
 }
 
-func newRefreshHandler(refresher httpapi.ServerRefresher) http.Handler {
+func newRefreshHandler(t *testing.T, refresher httpapi.ServerRefresher) http.Handler {
+	t.Helper()
+
 	return httpapi.NewHandler(httpapi.Options{
-		Registry:  failingRegistry{err: errors.New("unused")},
-		Refresher: refresher,
-		Logger:    slog.New(slog.NewTextHandler(io.Discard, nil)),
+		Registry:      failingRegistry{err: errors.New("unused")},
+		Refresher:     refresher,
+		Authenticator: testAuthorizer(t),
+		Logger:        slog.New(slog.NewTextHandler(io.Discard, nil)),
 	})
 }
 
 // 动作路由以 202 接受：真正的拉取由后台完成，调用方通过 GET 观察状态。
 func TestRefreshToolsAccepted(t *testing.T) {
 	refresher := &fakeRefresher{srv: refreshableServer()}
-	h := newRefreshHandler(refresher)
+	h := newRefreshHandler(t, refresher)
 
 	rec := do(t, h, http.MethodPost, "/api/v1/mcp-servers/srv-1:refresh-tools", "")
 	if rec.Code != http.StatusAccepted {
@@ -485,7 +524,7 @@ func TestRefreshToolsDomainErrors(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			refresher := &fakeRefresher{err: tt.err}
-			h := newRefreshHandler(refresher)
+			h := newRefreshHandler(t, refresher)
 
 			rec := do(t, h, http.MethodPost, "/api/v1/mcp-servers/srv-1:refresh-tools", "")
 			if rec.Code != tt.wantCode {
@@ -508,7 +547,7 @@ func TestActionRouteRejectsUnknownShapes(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			refresher := &fakeRefresher{srv: refreshableServer()}
-			h := newRefreshHandler(refresher)
+			h := newRefreshHandler(t, refresher)
 
 			rec := do(t, h, http.MethodPost, tt.path, "")
 			if rec.Code != http.StatusNotFound {
@@ -524,13 +563,157 @@ func TestActionRouteRejectsUnknownShapes(t *testing.T) {
 
 func TestActionRouteAbsentWithoutRefresher(t *testing.T) {
 	handler := httpapi.NewHandler(httpapi.Options{
-		Registry: failingRegistry{err: errors.New("unused")},
-		Logger:   slog.New(slog.NewTextHandler(io.Discard, nil)),
+		Registry:      failingRegistry{err: errors.New("unused")},
+		Authenticator: testAuthorizer(t),
+		Logger:        slog.New(slog.NewTextHandler(io.Discard, nil)),
 	})
 
 	// 未配置 Refresher 时不注册动作模式：该路径只匹配 GET /{id}，因此是 405 而非命中动作 handler。
 	rec := do(t, handler, http.MethodPost, "/api/v1/mcp-servers/srv-1:refresh-tools", "")
 	if rec.Code != http.StatusMethodNotAllowed {
 		t.Fatalf("status = %d, want 405 when no refresher is configured; body: %s", rec.Code, rec.Body)
+	}
+}
+
+func TestManagementAPIRequiresCredentials(t *testing.T) {
+	h := newTestHandler(t)
+
+	tests := []struct{ name, method, path, body string }{
+		{"register", http.MethodPost, "/api/v1/mcp-servers", registerWeather},
+		{"get", http.MethodGet, "/api/v1/mcp-servers/srv-1", ""},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			rec := doRequest(t, h, tt.method, tt.path, tt.body, nil)
+			if rec.Code != http.StatusUnauthorized {
+				t.Fatalf("status = %d, want 401; body: %s", rec.Code, rec.Body)
+			}
+			if got := rec.Header().Get("WWW-Authenticate"); got != `Bearer realm="agentnexus"` {
+				t.Errorf("WWW-Authenticate = %q, want the Bearer challenge", got)
+			}
+			assertErrorCode(t, rec, "unauthenticated")
+		})
+	}
+
+	// 无凭证的注册请求不产生任何副作用：srv-1 仍然不存在。
+	rec := do(t, h, http.MethodGet, "/api/v1/mcp-servers/srv-1", "")
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("status after rejected register = %d, want 404 (no row written); body: %s", rec.Code, rec.Body)
+	}
+}
+
+func TestAgentCredentialsAreDeniedOnManagementAPI(t *testing.T) {
+	h := newTestHandler(t)
+
+	tests := []struct {
+		name    string
+		headers map[string]string
+	}{
+		{"bearer", map[string]string{"Authorization": "Bearer " + testAgentSecret}},
+		{"x-api-key", map[string]string{"X-API-Key": testAgentSecret}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			rec := doRequest(t, h, http.MethodPost, "/api/v1/mcp-servers", registerWeather, tt.headers)
+			if rec.Code != http.StatusForbidden {
+				t.Fatalf("status = %d, want 403; body: %s", rec.Code, rec.Body)
+			}
+			if got := rec.Header().Get("WWW-Authenticate"); got != "" {
+				t.Errorf("WWW-Authenticate = %q, want none on 403", got)
+			}
+			assertErrorCode(t, rec, "permission_denied")
+		})
+	}
+}
+
+func TestUnknownCredentialsAndUnregisteredPaths(t *testing.T) {
+	h := newTestHandler(t)
+
+	rec := doRequest(t, h, http.MethodGet, "/api/v1/mcp-servers/srv-1", "", map[string]string{
+		"Authorization": "Bearer not-a-key",
+	})
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("unknown key status = %d, want 401; body: %s", rec.Code, rec.Body)
+	}
+
+	// 未登记策略的路径默认拒绝：连合法 admin 也进不去，且不会暴露路由是否存在。
+	rec = doRequest(t, h, http.MethodGet, "/internal/debug", "", map[string]string{
+		"Authorization": "Bearer " + testAdminSecret,
+	})
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("unregistered path with admin key status = %d, want 403; body: %s", rec.Code, rec.Body)
+	}
+	assertErrorCode(t, rec, "permission_denied")
+
+	rec = doRequest(t, h, http.MethodGet, "/internal/debug", "", nil)
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("unregistered path without credentials status = %d, want 401; body: %s", rec.Code, rec.Body)
+	}
+}
+
+func TestCredentialExtraction(t *testing.T) {
+	h := newTestHandler(t)
+
+	tests := []struct {
+		name     string
+		headers  map[string]string
+		wantCode int
+	}{
+		{
+			name:     "bearer scheme is case insensitive",
+			headers:  map[string]string{"Authorization": "bearer " + testAdminSecret},
+			wantCode: http.StatusNotFound,
+		},
+		{
+			name:     "x-api-key is accepted",
+			headers:  map[string]string{"X-API-Key": testAdminSecret},
+			wantCode: http.StatusNotFound,
+		},
+		{
+			name:     "surrounding whitespace is trimmed",
+			headers:  map[string]string{"X-API-Key": "  " + testAdminSecret + "  "},
+			wantCode: http.StatusNotFound,
+		},
+		{
+			name: "non bearer scheme does not fall back to x-api-key",
+			headers: map[string]string{
+				"Authorization": "Basic " + base64.StdEncoding.EncodeToString([]byte("admin:"+testAdminSecret)),
+				"X-API-Key":     testAdminSecret,
+			},
+			wantCode: http.StatusUnauthorized,
+		},
+		{
+			name:     "bearer without token",
+			headers:  map[string]string{"Authorization": "Bearer"},
+			wantCode: http.StatusUnauthorized,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			// 认证通过时该请求落到 GET /{id}，因此 404 是"已认证"的证明。
+			rec := doRequest(t, h, http.MethodGet, "/api/v1/mcp-servers/srv-1", "", tt.headers)
+			if rec.Code != tt.wantCode {
+				t.Fatalf("status = %d, want %d; body: %s", rec.Code, tt.wantCode, rec.Body)
+			}
+		})
+	}
+}
+
+// 装配遗漏（nil Authenticator）失败关闭：连探针也不放行，避免"忘装配 = 裸网关"。
+func TestAuthenticatorMissingFailsClosed(t *testing.T) {
+	var logs bytes.Buffer
+	h := httpapi.NewHandler(httpapi.Options{
+		Registry: failingRegistry{err: errors.New("unused")},
+		Logger:   slog.New(slog.NewTextHandler(&logs, nil)),
+	})
+
+	rec := doRequest(t, h, http.MethodGet, "/health/live", "", nil)
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("status = %d, want 403 when no authenticator is wired; body: %s", rec.Code, rec.Body)
+	}
+	assertErrorCode(t, rec, "permission_denied")
+	if !strings.Contains(logs.String(), "no authenticator configured") {
+		t.Errorf("missing authenticator was not logged; log output: %q", logs.String())
 	}
 }

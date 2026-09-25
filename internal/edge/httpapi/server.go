@@ -8,11 +8,13 @@ import (
 
 // Options 是 HTTP 层路由装配的依赖。Registry 之外的依赖均可选：
 // Refresher 为 nil 时不注册动作路由，MCP 为 nil 时不挂载 /mcp。
+// Authenticator 为 nil 时失败关闭（所有请求 403），生产装配永远传入真实 Authorizer。
 type Options struct {
-	Registry  ServerRegistry
-	Refresher ServerRefresher
-	MCP       http.Handler
-	Logger    *slog.Logger
+	Registry      ServerRegistry
+	Refresher     ServerRefresher
+	MCP           http.Handler
+	Authenticator Authenticator
+	Logger        *slog.Logger
 }
 
 // NewHandler 装配管理路由与可选端点。Logger 为 nil 时使用 slog.Default()。
@@ -40,7 +42,8 @@ func NewHandler(opts Options) http.Handler {
 	if opts.MCP != nil {
 		mux.Handle("/mcp", opts.MCP)
 	}
-	return mux
+
+	return withAuth(mux, opts.Authenticator, logger)
 }
 
 func NewServer(address string, handler http.Handler) *http.Server {
