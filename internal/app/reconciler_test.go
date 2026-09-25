@@ -278,8 +278,9 @@ func TestNewLifecycleRequiresDependencies(t *testing.T) {
 		name string
 		opts app.LifecycleOptions
 	}{
-		{"missing registry", app.LifecycleOptions{Syncer: &fakeSyncer{}}},
-		{"missing syncer", app.LifecycleOptions{Registry: &fakeRegistry{}}},
+		{"missing registry", app.LifecycleOptions{Syncer: &fakeSyncer{}, Auditor: &recordingAuditor{}}},
+		{"missing syncer", app.LifecycleOptions{Registry: &fakeRegistry{}, Auditor: &recordingAuditor{}}},
+		{"missing auditor", app.LifecycleOptions{Registry: &fakeRegistry{}, Syncer: &fakeSyncer{}}},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {

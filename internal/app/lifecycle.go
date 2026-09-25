@@ -10,6 +10,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/yhwyxy/AgentNexus/internal/audit"
 	"github.com/yhwyxy/AgentNexus/internal/server"
 	"github.com/yhwyxy/AgentNexus/internal/tool"
 )
@@ -21,6 +22,11 @@ type ServerRegistry interface {
 	Get(ctx context.Context, id server.ID) (server.Server, error)
 }
 
+// AuditRecorder 是 Lifecycle 对审计写入的最小依赖（消费者定义接口）。
+type AuditRecorder interface {
+	Record(ctx context.Context, in audit.Input) error
+}
+
 // ToolSynchronizer 是 Lifecycle 对 Tool 同步服务的最小依赖。
 type ToolSynchronizer interface {
 	Sync(ctx context.Context, id server.ID) (tool.SyncResult, error)
@@ -28,9 +34,10 @@ type ToolSynchronizer interface {
 
 // LifecycleOptions 是 Lifecycle 的装配参数。
 type LifecycleOptions struct {
-	// Registry 与 Syncer 必填。
+	// Registry、Syncer 与 Auditor 必填。
 	Registry ServerRegistry
 	Syncer   ToolSynchronizer
+	Auditor  AuditRecorder
 	// Lister 为 nil 时关闭启动重放与周期巡检，只保留注册触发。
 	Lister ServerLister
 	// ReconcileInterval <= 0 时只做启动重放，不做周期巡检。
@@ -44,6 +51,7 @@ type LifecycleOptions struct {
 type Lifecycle struct {
 	registry ServerRegistry
 	syncer   ToolSynchronizer
+	auditor  AuditRecorder
 	logger   *slog.Logger
 
 	lister            ServerLister
@@ -70,6 +78,9 @@ func NewLifecycle(opts LifecycleOptions) (*Lifecycle, error) {
 	if opts.Syncer == nil {
 		return nil, errors.New("new lifecycle: tool synchronizer is required")
 	}
+	if opts.Auditor == nil {
+		return nil, errors.New("new lifecycle: audit recorder is required")
+	}
 	logger := opts.Logger
 	if logger == nil {
 		logger = slog.Default()
@@ -79,6 +90,7 @@ func NewLifecycle(opts LifecycleOptions) (*Lifecycle, error) {
 	lifecycle := &Lifecycle{
 		registry:          opts.Registry,
 		syncer:            opts.Syncer,
+		auditor:           opts.Auditor,
 		logger:            logger,
 		lister:            opts.Lister,
 		reconcileInterval: opts.ReconcileInterval,
@@ -218,9 +230,22 @@ func (l *Lifecycle) syncServer(id server.ID) {
 		l.mu.Unlock()
 	}()
 
+	// 审计用不可取消的 ctx：同步失败常常正是因为生命周期被取消（关停），
+	// 而这种失败恰恰是最需要留下记录的事实。
+	auditCtx := context.WithoutCancel(l.ctx)
+
 	result, err := l.syncer.Sync(l.ctx, id)
 	if err != nil {
 		l.logger.Error("tool sync failed", "server_id", id, "error", err)
+		l.record(auditCtx, audit.Input{
+			Type:      audit.EventToolSyncFailed,
+			Outcome:   audit.OutcomeOf(err),
+			AssetID:   string(id),
+			AssetName: l.assetName(auditCtx, id),
+			Target:    string(id),
+			ErrorCode: audit.ErrorCode(err),
+		})
+
 		return
 	}
 	l.logger.Info("tool catalog refreshed",
@@ -229,4 +254,36 @@ func (l *Lifecycle) syncServer(id server.ID) {
 		"generation", result.Snapshot.Generation,
 		"tool_count", result.Snapshot.ToolCount,
 	)
+	l.record(auditCtx, audit.Input{
+		Type:      audit.EventToolSnapshotPublished,
+		Outcome:   audit.OutcomeSuccess,
+		AssetID:   string(id),
+		AssetName: l.assetName(auditCtx, id),
+		Target:    result.Snapshot.ID,
+		Detail: audit.Detail(map[string]any{
+			"changed":    result.Changed,
+			"generation": result.Snapshot.Generation,
+			"tool_count": result.Snapshot.ToolCount,
+		}),
+	})
+}
+
+// assetName 为审计事件补一个可读的资产名。查不到就留空：
+// 事件的价值在 id 与结局，名字只是给人看的冗余字段。
+func (l *Lifecycle) assetName(ctx context.Context, id server.ID) string {
+	srv, err := l.registry.Get(ctx, id)
+	if err != nil {
+		return ""
+	}
+
+	return srv.Name
+}
+
+func (l *Lifecycle) record(ctx context.Context, in audit.Input) {
+	if l.auditor == nil {
+		return
+	}
+	if err := l.auditor.Record(ctx, in); err != nil {
+		l.logger.Error("record audit event", "event_type", in.Type, "error", err)
+	}
 }
