@@ -20,13 +20,15 @@ type Policy struct {
 }
 
 // DefaultPolicy 是 v0.1 的线上策略（详细设计 §13 的路由表）：
-// 探针公开，管理 API 仅 admin，/mcp 数据面 admin 与 agent 都可调用。
+// 探针公开，管理 API 仅 admin，/mcp 数据面 admin 与 agent 都可调用，
+// /metrics 仅 admin（label 含资产名，属运维面信息）。
 func DefaultPolicy() Policy {
 	return Policy{
 		Public: []string{"/health/live", "/health/ready"},
 		Rules: []Rule{
 			{Prefix: "/api/v1/", Roles: []Role{RoleAdmin}},
 			{Prefix: "/mcp", Roles: []Role{RoleAgent, RoleAdmin}},
+			{Prefix: "/metrics", Roles: []Role{RoleAdmin}},
 		},
 	}
 }

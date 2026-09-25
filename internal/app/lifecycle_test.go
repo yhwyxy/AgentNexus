@@ -21,7 +21,10 @@ func testLogger() *slog.Logger {
 }
 
 // fakeRegistry 记录调用并返回可注入的错误；用于隔离 Lifecycle 自身的编排行为。
+// 调用记录会被后台 sync worker 与测试 goroutine 同时访问，因此加锁
+// （否则 -race 下会出现测试自身的竞态）。
 type fakeRegistry struct {
+	mu     sync.Mutex
 	srv    server.Server
 	err    error
 	inputs []server.RegisterInput
@@ -29,7 +32,10 @@ type fakeRegistry struct {
 }
 
 func (f *fakeRegistry) Register(_ context.Context, in server.RegisterInput) (server.Server, error) {
+	f.mu.Lock()
 	f.inputs = append(f.inputs, in)
+	f.mu.Unlock()
+
 	if f.err != nil {
 		return server.Server{}, f.err
 	}
@@ -37,11 +43,29 @@ func (f *fakeRegistry) Register(_ context.Context, in server.RegisterInput) (ser
 }
 
 func (f *fakeRegistry) Get(_ context.Context, id server.ID) (server.Server, error) {
+	f.mu.Lock()
 	f.gets = append(f.gets, id)
+	f.mu.Unlock()
+
 	if f.err != nil {
 		return server.Server{}, f.err
 	}
 	return f.srv, nil
+}
+
+// registeredInputs / fetchedIDs 返回调用记录的副本，避免测试读到正在追加的切片。
+func (f *fakeRegistry) registeredInputs() []server.RegisterInput {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	return append([]server.RegisterInput(nil), f.inputs...)
+}
+
+func (f *fakeRegistry) fetchedIDs() []server.ID {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	return append([]server.ID(nil), f.gets...)
 }
 
 // fakeSyncer 可阻塞、可按 Server 注入失败，并记录每次被消费的 ID。
@@ -152,8 +176,9 @@ func TestLifecycleSyncsAfterRegister(t *testing.T) {
 	if created.ID != "srv-1" {
 		t.Fatalf("register returned %#v", created)
 	}
-	if len(registry.inputs) != 1 || registry.inputs[0].Name != "weather" {
-		t.Fatalf("registry inputs = %#v", registry.inputs)
+	inputs := registry.registeredInputs()
+	if len(inputs) != 1 || inputs[0].Name != "weather" {
+		t.Fatalf("registry inputs = %#v", inputs)
 	}
 	waitForID(t, syncer.started, "srv-1")
 
@@ -162,8 +187,9 @@ func TestLifecycleSyncsAfterRegister(t *testing.T) {
 		t.Fatalf("get: %v", err)
 	}
 	// gets 可能多于一次：同步结束后的审计事件会再读一次资产名（见 Lifecycle.assetName）。
-	if got.ID != "srv-1" || len(registry.gets) == 0 || registry.gets[0] != "srv-1" {
-		t.Fatalf("get delegated to %v returning %#v", registry.gets, got)
+	gets := registry.fetchedIDs()
+	if got.ID != "srv-1" || len(gets) == 0 || gets[0] != "srv-1" {
+		t.Fatalf("get delegated to %v returning %#v", gets, got)
 	}
 }
 
